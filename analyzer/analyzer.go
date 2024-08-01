@@ -83,6 +83,11 @@ func GetCapabilityInfo(pkgs []*packages.Package, queriedPackages map[*types.Pack
 			return nil, err
 		}
 	}
+	if g == granularityIntermediate {
+		// intermediate packages are calculated with the graph generation
+		// algorithm.
+		return intermediatePackages(pkgs, queriedPackages, config)
+	}
 	type output struct {
 		*cpb.CapabilityInfo
 		*ssa.Function // used for sorting
@@ -775,4 +780,86 @@ func forEachPath(pkgs []*packages.Package, queriedPackages map[*types.Package]st
 			}
 		}
 	}
+}
+
+// intermediatePackages returns a CapabilityInfo for each unique (P, C) pair
+// where there is a call path from a function in one of the queried packages
+// to a function with capability C, and the call path includes a function in
+// package P.
+func intermediatePackages(pkgs []*packages.Package, queriedPackages map[*types.Package]struct{}, config *Config) (*cpb.CapabilityInfoList, error) {
+	capabilities, negated, err := parseCapabilitiesList(config.Capabilities)
+	if err != nil {
+		return nil, err
+	}
+	type packageAndCapability struct {
+		pkg *types.Package
+		cpb.Capability
+	}
+	seen := make(map[packageAndCapability]*cpb.CapabilityInfo)
+
+	// The function CapabilityGraph will call filter for each capability, and
+	// then generate the graph for that capability, calling nodeCallback for
+	// each node in that graph.  We store the capability that was passed to
+	// filter in a variable, so that it is available to nodeCallback.
+	var capability cpb.Capability
+	filter := func(c cpb.Capability) bool {
+		capability = c
+		_, ok := capabilities[c]
+		return ok != negated
+	}
+
+	nodeCallback := func(queryBFS bfsStateMap, node *callgraph.Node, capabilityBFS bfsStateMap) {
+		pkg := nodeToPackage(node)
+		if pkg == nil {
+			// This node represents some kind of wrapper function that we don't need
+			// to consider.
+			return
+		}
+		pc := packageAndCapability{pkg, capability}
+		if _, ok := seen[pc]; ok {
+			return
+		}
+		ci := cpb.CapabilityInfo{
+			Capability:  capability.Enum(),
+			PackageDir:  proto.String(pkg.Path()),
+			PackageName: proto.String(pkg.Name()),
+		}
+		// Add ci.Path entries for the part of the path leading to node, including
+		// node itself.
+		for v := node; v != nil; {
+			e := queryBFS[v].edge
+			addFunction(&ci.Path, v, e)
+			if e == nil {
+				break
+			}
+			v = e.Caller
+		}
+		// Reverse the path we have so far, since we visited nodes in reverse
+		// order.
+		for i, j := 0, len(ci.Path)-1; i < j; i, j = i+1, j-1 {
+			ci.Path[i], ci.Path[j] = ci.Path[j], ci.Path[i]
+		}
+		// Add ci.Path entries for the part of the path leading from node.
+		for v := node; v != nil; {
+			e := capabilityBFS[v].edge
+			if e == nil {
+				break
+			}
+			v = e.Callee
+			addFunction(&ci.Path, v, e)
+		}
+		seen[pc] = &ci
+	}
+	CapabilityGraph(pkgs, queriedPackages, config, nodeCallback, nil, nil, filter)
+	cis := make([]*cpb.CapabilityInfo, 0, len(seen))
+	for _, ci := range seen {
+		cis = append(cis, ci)
+	}
+	sort.Slice(cis, func(i, j int) bool {
+		if x, y := cis[i].GetCapability(), cis[j].GetCapability(); x != y {
+			return x < y
+		}
+		return cis[i].GetPackageDir() < cis[j].GetPackageDir()
+	})
+	return &cpb.CapabilityInfoList{CapabilityInfo: cis}, nil
 }

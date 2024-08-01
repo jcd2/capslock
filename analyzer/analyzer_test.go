@@ -19,6 +19,7 @@ import (
 	"golang.org/x/tools/go/analysis/analysistest"
 	"golang.org/x/tools/go/callgraph"
 	"golang.org/x/tools/go/packages"
+	"google.golang.org/protobuf/encoding/protojson"
 	"google.golang.org/protobuf/proto"
 	"google.golang.org/protobuf/testing/protocmp"
 )
@@ -442,6 +443,173 @@ func TestParseCapabilitiesList(t *testing.T) {
 		_, _, err := parseCapabilitiesList(list)
 		if err == nil {
 			t.Errorf("parseCapabilitiesList(%q): got err == nil, want error", list)
+		}
+	}
+}
+
+func TestIntermediatePackages(t *testing.T) {
+	filemap := map[string]string{
+		"p1/p1.go": `package p1; func Foo() { Bar() }; func Bar() { }`,
+		"p2/p2.go": `package p2; import "p1"; func Foo() { p1.Foo() }`,
+		"p3/p3.go": `package p3; import "p1"; func Foo() { p1.Foo() }; func Bar() { p1.Bar() }`,
+		"p4/p4.go": `package p4; import "p2"; import "p3"; func Foo() { p2.Foo(); p3.Foo(); p3.Bar() }; func Bar() { }`,
+	}
+	classifier := testClassifier{
+		functions: map[[2]string]cpb.Capability{
+			{"p1", "p1.Foo"}: cpb.Capability_CAPABILITY_FILES,
+			{"p1", "p1.Bar"}: cpb.Capability_CAPABILITY_MODIFY_SYSTEM_STATE,
+			{"p4", "p4.Bar"}: cpb.Capability_CAPABILITY_READ_SYSTEM_STATE,
+		},
+		ignoredEdges: nil,
+	}
+	pkgs, queriedPackages, cleanup, err := setup(filemap, "p4")
+	if cleanup != nil {
+		defer cleanup()
+	}
+	if err != nil {
+		t.Fatalf("setup: %v", err)
+	}
+	for _, test := range []struct {
+		capabilities string
+		expected     *cpb.CapabilityInfoList
+	}{
+		{
+			capabilities: "", // all
+			expected: &cpb.CapabilityInfoList{
+				CapabilityInfo: []*cpb.CapabilityInfo{
+					{
+						PackageName: proto.String("p1"),
+						Capability:  cpb.Capability_CAPABILITY_FILES.Enum(),
+						Path: []*cpb.Function{
+							&cpb.Function{Name: proto.String("p4.Foo"), Package: proto.String("p4")},
+							&cpb.Function{Name: proto.String("p2.Foo"), Package: proto.String("p2")},
+							&cpb.Function{Name: proto.String("p1.Foo"), Package: proto.String("p1")},
+						},
+						PackageDir: proto.String("p1"),
+					},
+					{
+						PackageName: proto.String("p2"),
+						Capability:  cpb.Capability_CAPABILITY_FILES.Enum(),
+						Path: []*cpb.Function{
+							&cpb.Function{Name: proto.String("p4.Foo"), Package: proto.String("p4")},
+							&cpb.Function{Name: proto.String("p2.Foo"), Package: proto.String("p2")},
+							&cpb.Function{Name: proto.String("p1.Foo"), Package: proto.String("p1")},
+						},
+						PackageDir: proto.String("p2"),
+					},
+					{
+						PackageName: proto.String("p3"),
+						Capability:  cpb.Capability_CAPABILITY_FILES.Enum(),
+						Path: []*cpb.Function{
+							&cpb.Function{Name: proto.String("p4.Foo"), Package: proto.String("p4")},
+							&cpb.Function{Name: proto.String("p3.Foo"), Package: proto.String("p3")},
+							&cpb.Function{Name: proto.String("p1.Foo"), Package: proto.String("p1")},
+						},
+						PackageDir: proto.String("p3"),
+					},
+					{
+						PackageName: proto.String("p4"),
+						Capability:  cpb.Capability_CAPABILITY_FILES.Enum(),
+						Path: []*cpb.Function{
+							&cpb.Function{Name: proto.String("p4.Foo"), Package: proto.String("p4")},
+							&cpb.Function{Name: proto.String("p2.Foo"), Package: proto.String("p2")},
+							&cpb.Function{Name: proto.String("p1.Foo"), Package: proto.String("p1")},
+						},
+						PackageDir: proto.String("p4"),
+					},
+					{
+						PackageName: proto.String("p4"),
+						Capability:  cpb.Capability_CAPABILITY_READ_SYSTEM_STATE.Enum(),
+						Path: []*cpb.Function{
+							&cpb.Function{Name: proto.String("p4.Bar"), Package: proto.String("p4")},
+						},
+						PackageDir: proto.String("p4"),
+					},
+					{
+						PackageName: proto.String("p1"),
+						Capability:  cpb.Capability_CAPABILITY_MODIFY_SYSTEM_STATE.Enum(),
+						Path: []*cpb.Function{
+							&cpb.Function{Name: proto.String("p4.Foo"), Package: proto.String("p4")},
+							&cpb.Function{Name: proto.String("p3.Bar"), Package: proto.String("p3")},
+							&cpb.Function{Name: proto.String("p1.Bar"), Package: proto.String("p1")},
+						},
+						PackageDir: proto.String("p1"),
+					},
+					{
+						PackageName: proto.String("p3"),
+						Capability:  cpb.Capability_CAPABILITY_MODIFY_SYSTEM_STATE.Enum(),
+						Path: []*cpb.Function{
+							&cpb.Function{Name: proto.String("p4.Foo"), Package: proto.String("p4")},
+							&cpb.Function{Name: proto.String("p3.Bar"), Package: proto.String("p3")},
+							&cpb.Function{Name: proto.String("p1.Bar"), Package: proto.String("p1")},
+						},
+						PackageDir: proto.String("p3"),
+					},
+					{
+						PackageName: proto.String("p4"),
+						Capability:  cpb.Capability_CAPABILITY_MODIFY_SYSTEM_STATE.Enum(),
+						Path: []*cpb.Function{
+							&cpb.Function{Name: proto.String("p4.Foo"), Package: proto.String("p4")},
+							&cpb.Function{Name: proto.String("p3.Bar"), Package: proto.String("p3")},
+							&cpb.Function{Name: proto.String("p1.Bar"), Package: proto.String("p1")},
+						},
+						PackageDir: proto.String("p4"),
+					},
+				},
+			},
+		},
+		{
+			capabilities: "READ_SYSTEM_STATE",
+			expected: &cpb.CapabilityInfoList{
+				CapabilityInfo: []*cpb.CapabilityInfo{
+					{
+						PackageName: proto.String("p4"),
+						Capability:  cpb.Capability_CAPABILITY_READ_SYSTEM_STATE.Enum(),
+						Path: []*cpb.Function{
+							&cpb.Function{Name: proto.String("p4.Bar"), Package: proto.String("p4")},
+						},
+						PackageDir: proto.String("p4"),
+					},
+				},
+			},
+		},
+	} {
+		cil, err := GetCapabilityInfo(pkgs, queriedPackages, &Config{
+			Classifier:     &classifier,
+			DisableBuiltin: true,
+			Granularity:    "intermediate",
+			Capabilities:   test.capabilities,
+		})
+		if err != nil {
+			t.Fatalf("GetCapabilityInfo: %v", err)
+		}
+		opts := []cmp.Option{
+			protocmp.Transform(),
+			protocmp.SortRepeated(func(a, b *cpb.CapabilityInfo) bool {
+				if u, v := a.GetCapability(), b.GetCapability(); u != v {
+					return u < v
+				}
+				return a.GetPackageDir() < b.GetPackageDir()
+			}),
+			protocmp.IgnoreFields(&cpb.CapabilityInfoList{}, "package_info"),
+			protocmp.IgnoreFields(&cpb.CapabilityInfo{}, "dep_path"),
+			protocmp.IgnoreFields(&cpb.CapabilityInfo{}, "capability_type"),
+			protocmp.IgnoreFields(&cpb.Function{}, "site"),
+			protocmp.IgnoreFields(&cpb.Function_Site{}, "filename"),
+			protocmp.IgnoreFields(&cpb.Function_Site{}, "line"),
+			protocmp.IgnoreFields(&cpb.Function_Site{}, "column"),
+		}
+		if diff := cmp.Diff(test.expected, cil, opts...); diff != "" {
+			got, err := protojson.MarshalOptions{Multiline: true, Indent: "\t"}.Marshal(cil)
+			if err != nil {
+				t.Fatalf("internal error: couldn't marshal protocol buffer: %v", err)
+			}
+			want, err := protojson.MarshalOptions{Multiline: true, Indent: "\t"}.Marshal(test.expected)
+			if err != nil {
+				t.Fatalf("internal error: couldn't marshal protocol buffer: %v", err)
+			}
+			t.Errorf("GetCapabilityInfo: got %v, want %v; diff %s",
+				string(got), string(want), diff)
 		}
 	}
 }

@@ -22,8 +22,9 @@ import (
 type granularity int8
 
 const (
-	granularityPackage  granularity = iota // compare capabilities per package
-	granularityFunction                    // compare capabilities per function
+	granularityPackage      granularity = iota // compare capabilities per package
+	granularityFunction                        // compare capabilities per function
+	granularityIntermediate                    // compare capabilities per intermediate package
 )
 
 func granularityFromString(g string) (granularity, error) {
@@ -32,6 +33,8 @@ func granularityFromString(g string) (granularity, error) {
 		return granularityPackage, nil
 	case "function":
 		return granularityFunction, nil
+	case "intermediate":
+		return granularityIntermediate, nil
 	default:
 		return 0, fmt.Errorf("unknown granularity: %q", g)
 	}
@@ -87,6 +90,13 @@ func populateMap(cil *cpb.CapabilityInfoList, g granularity) capabilitiesMap {
 			mk.key = ci.Path[0].GetName()
 			if mk.key != "" {
 				m[mk] = ci
+			}
+		case granularityIntermediate:
+			for _, f := range ci.Path {
+				mk.key = f.GetPackage()
+				if mk.key != "" {
+					m[mk] = ci
+				}
 			}
 		}
 	}
