@@ -60,10 +60,13 @@ func TestAnalysis(t *testing.T) {
 	if err != nil {
 		t.Fatalf("setup: %v", err)
 	}
-	cil := GetCapabilityInfo(pkgs, queriedPackages, &Config{
+	cil, err := GetCapabilityInfo(pkgs, queriedPackages, &Config{
 		Classifier:     interesting.DefaultClassifier(),
 		DisableBuiltin: false,
 	})
+	if err != nil {
+		t.Fatalf("GetCapabilityInfo: %v", err)
+	}
 	expected := &cpb.CapabilityInfoList{
 		CapabilityInfo: []*cpb.CapabilityInfo{{
 			PackageName: proto.String("testlib"),
@@ -179,10 +182,13 @@ func TestAnalysisWithClassifier(t *testing.T) {
 	if err != nil {
 		t.Fatalf("setup: %v", err)
 	}
-	cil := GetCapabilityInfo(pkgs, queriedPackages, &Config{
+	cil, err := GetCapabilityInfo(pkgs, queriedPackages, &Config{
 		Classifier:     &testClassifier1,
 		DisableBuiltin: true,
 	})
+	if err != nil {
+		t.Fatalf("GetCapabilityInfo: %v", err)
+	}
 	expected := &cpb.CapabilityInfoList{
 		CapabilityInfo: []*cpb.CapabilityInfo{{
 			PackageName: proto.String("testlib"),
@@ -286,6 +292,54 @@ func TestGraphWithClassifier(t *testing.T) {
 	if !reflect.DeepEqual(caps, expectedCaps) {
 		t.Errorf("CapabilityGraph(%v): got capabilities %v want %v",
 			filemap, caps, expectedCaps)
+	}
+}
+
+func TestAnalysisPackageGranularity(t *testing.T) {
+	pkgs, queriedPackages, cleanup, err := setup(filemap, "testlib")
+	if cleanup != nil {
+		defer cleanup()
+	}
+	if err != nil {
+		t.Fatalf("setup: %v", err)
+	}
+	cil, err := GetCapabilityInfo(pkgs, queriedPackages, &Config{
+		Classifier:     &testClassifier1,
+		DisableBuiltin: true,
+		Granularity:    "package",
+	})
+	if err != nil {
+		t.Fatalf("GetCapabilityInfo: %v", err)
+	}
+	expected := &cpb.CapabilityInfoList{
+		CapabilityInfo: []*cpb.CapabilityInfo{{
+			PackageName: proto.String("testlib"),
+			Capability:  cpb.Capability_CAPABILITY_FILES.Enum(),
+			Path: []*cpb.Function{
+				&cpb.Function{Name: proto.String("testlib.A"), Package: proto.String("testlib")},
+				&cpb.Function{Name: proto.String("testlib.B"), Package: proto.String("testlib")},
+				&cpb.Function{Name: proto.String("testlib.C"), Package: proto.String("testlib")},
+				&cpb.Function{Name: proto.String("os.IsExist"), Package: proto.String("os")},
+			},
+			PackageDir:     proto.String("testlib"),
+			CapabilityType: cpb.CapabilityType_CAPABILITY_TYPE_DIRECT.Enum(),
+		}},
+	}
+	opts := []cmp.Option{
+		protocmp.Transform(),
+		protocmp.SortRepeated(func(a, b *cpb.CapabilityInfo) bool {
+			return a.GetDepPath() < b.GetDepPath()
+		}),
+		protocmp.IgnoreFields(&cpb.CapabilityInfoList{}, "package_info"),
+		protocmp.IgnoreFields(&cpb.CapabilityInfo{}, "dep_path"),
+		protocmp.IgnoreFields(&cpb.Function{}, "site"),
+		protocmp.IgnoreFields(&cpb.Function_Site{}, "filename"),
+		protocmp.IgnoreFields(&cpb.Function_Site{}, "line"),
+		protocmp.IgnoreFields(&cpb.Function_Site{}, "column"),
+	}
+	if diff := cmp.Diff(expected, cil, opts...); diff != "" {
+		t.Errorf("GetCapabilityInfo(%v): got %v, want %v; diff %s",
+			filemap, cil, expected, diff)
 	}
 }
 

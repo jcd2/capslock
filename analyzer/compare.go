@@ -38,9 +38,13 @@ func granularityFromString(g string) (granularity, error) {
 }
 
 func compare(baselineFilename string, pkgs []*packages.Package, queriedPackages map[*types.Package]struct{}, config *Config) (different bool, err error) {
-	g, err := granularityFromString(config.Granularity)
-	if err != nil {
-		return false, err
+	var g granularity = granularityPackage
+	if config.Granularity != "" {
+		var err error
+		g, err = granularityFromString(config.Granularity)
+		if err != nil {
+			return false, err
+		}
 	}
 	compareData, err := os.ReadFile(baselineFilename)
 	if err != nil {
@@ -51,7 +55,10 @@ func compare(baselineFilename string, pkgs []*packages.Package, queriedPackages 
 	if err != nil {
 		return false, fmt.Errorf("Comparison file should include output from running `%s -output=j`. Error from parsing comparison file: %v", programName(), err.Error())
 	}
-	cil := GetCapabilityInfo(pkgs, queriedPackages, config)
+	cil, err := GetCapabilityInfo(pkgs, queriedPackages, config)
+	if err != nil {
+		return false, err
+	}
 	return diffCapabilityInfoLists(baseline, cil, g), nil
 }
 

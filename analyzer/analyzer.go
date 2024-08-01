@@ -74,7 +74,15 @@ func GetClassifier(excludeUnanalyzed bool) *interesting.Classifier {
 //
 // One CapabilityInfo is returned for every (function, capability) pair, with
 // one example path in the callgraph that demonstrates that capability.
-func GetCapabilityInfo(pkgs []*packages.Package, queriedPackages map[*types.Package]struct{}, config *Config) *cpb.CapabilityInfoList {
+func GetCapabilityInfo(pkgs []*packages.Package, queriedPackages map[*types.Package]struct{}, config *Config) (*cpb.CapabilityInfoList, error) {
+	var g granularity = granularityFunction
+	if config.Granularity != "" {
+		var err error
+		g, err = granularityFromString(config.Granularity)
+		if err != nil {
+			return nil, err
+		}
+	}
 	type output struct {
 		*cpb.CapabilityInfo
 		*ssa.Function // used for sorting
@@ -120,6 +128,29 @@ func GetCapabilityInfo(pkgs []*packages.Package, queriedPackages map[*types.Pack
 		}
 		return funcCompare(caps[i].Function, caps[j].Function) < 0
 	})
+	if g == granularityPackage {
+		// Keep only the first entry in the sorted list for each (capability, package) pair.
+		type cp struct {
+			cpb.Capability
+			*ssa.Package
+		}
+		seen := make(map[cp]struct{})
+		n := 0
+		for i, c := range caps {
+			var pkg *ssa.Package
+			if c.Function != nil {
+				pkg = c.Function.Package()
+			}
+			cp := cp{c.CapabilityInfo.GetCapability(), pkg}
+			if _, ok := seen[cp]; ok {
+				continue
+			}
+			seen[cp] = struct{}{}
+			caps[n] = caps[i]
+			n++
+		}
+		caps = caps[:n]
+	}
 	cil := &cpb.CapabilityInfoList{
 		CapabilityInfo: make([]*cpb.CapabilityInfo, len(caps)),
 		ModuleInfo:     collectModuleInfo(pkgs),
@@ -128,7 +159,7 @@ func GetCapabilityInfo(pkgs []*packages.Package, queriedPackages map[*types.Pack
 	for i := range caps {
 		cil.CapabilityInfo[i] = caps[i].CapabilityInfo
 	}
-	return cil
+	return cil, nil
 }
 
 type CapabilityCounter struct {

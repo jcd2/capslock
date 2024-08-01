@@ -52,7 +52,10 @@ func RunCapslock(args []string, output string, pkgs []*packages.Package, queried
 		"format": templateFormat,
 	}
 	if output == "json" || output == "j" {
-		cil := GetCapabilityInfo(pkgs, queriedPackages, config)
+		cil, err := GetCapabilityInfo(pkgs, queriedPackages, config)
+		if err != nil {
+			return err
+		}
 		b, err := protojson.MarshalOptions{Multiline: true, Indent: "\t"}.Marshal(cil)
 		if err != nil {
 			return fmt.Errorf("internal error: couldn't marshal protocol buffer: %s", err.Error())

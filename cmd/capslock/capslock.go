@@ -39,7 +39,7 @@ var (
 	goarch         = flag.String("goarch", "", "GOARCH value to use when loading packages")
 	cpuprofile     = flag.String("cpuprofile", "", "write cpu profile to specified file")
 	memprofile     = flag.String("memprofile", "", "write memory profile to specified file")
-	granularity    = flag.String("granularity", "package",
+	granularity    = flag.String("granularity", "",
 		`the granularity to use for comparisons, either "package" or "function".`)
 )
 
