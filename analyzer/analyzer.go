@@ -9,6 +9,7 @@ package analyzer
 import (
 	"go/ast"
 	"go/types"
+	"path"
 	"slices"
 	"sort"
 	"strings"
@@ -34,6 +35,10 @@ type Config struct {
 	// CapabilitySet is the set of capabilities to use for graph output mode.
 	// If CapabilitySet is nil, all capabilities are used.
 	CapabilitySet *CapabilitySet
+
+	// Packages lists the packages being queried.
+	// This is used when importing an external callgraph.
+	Packages []string
 }
 
 // Classifier is an interface for types that help map code features to
@@ -158,6 +163,109 @@ func GetCapabilityInfo(pkgs []*packages.Package, queriedPackages map[*types.Pack
 		CapabilityInfo: make([]*cpb.CapabilityInfo, len(caps)),
 		ModuleInfo:     collectModuleInfo(pkgs),
 		PackageInfo:    collectPackageInfo(pkgs),
+	}
+	for i := range caps {
+		cil.CapabilityInfo[i] = caps[i].CapabilityInfo
+	}
+	return cil
+}
+
+// GetCapabilityInfoFromImportedGraph analyzes an imported callgraph.
+// It finds functions in the queried packages that have a path to a function with a capability.
+func GetCapabilityInfoFromImportedGraph(graph *cpb.Graph, queriedPackages map[string]struct{}, config *Config) *cpb.CapabilityInfoList {
+	if config.Granularity == GranularityUnset {
+		config.Granularity = GranularityFunction
+	}
+	type output struct {
+		*cpb.CapabilityInfo
+		Function int64
+	}
+	var caps []output
+
+	addFunction := func(fns *[]*cpb.Function, v *cpb.Graph_Function, incomingEdge *cpb.Graph_Call) {
+		fn := &cpb.Function{Name: proto.String(v.GetName())}
+		if p := v.GetPackage(); p != "" {
+			fn.Package = proto.String(p)
+		}
+		if incomingEdge != nil {
+			if s := incomingEdge.CallSite; s != nil {
+				fn.Site = &cpb.Function_Site{
+					Filename: proto.String(s.GetFilename()),
+					Line:     proto.Int64(s.GetLine()),
+					Column:   proto.Int64(s.GetColumn()),
+				}
+			}
+		}
+		*fns = append(*fns, fn)
+	}
+
+	forEachPath2(graph, queriedPackages,
+		func(cap cpb.Capability, nodes bfsStateMap2, v int64) {
+			i := 0
+			c := cpb.CapabilityInfo{}
+			v0 := v
+			var n string
+			var ctype cpb.CapabilityType
+			var incomingEdge *cpb.Graph_Call
+			for {
+				fn := graph.Functions[v]
+				addFunction(&c.Path, fn, incomingEdge)
+				if i == 0 {
+					n = fn.GetPackage()
+					ctype = cpb.CapabilityType_CAPABILITY_TYPE_DIRECT
+					c.Capability = cap.Enum()
+					if n != "" {
+						c.PackageDir = proto.String(n)
+						c.PackageName = proto.String(path.Base(n))
+					}
+				}
+				i++
+				if pName := fn.GetPackage(); n != pName && !isStdLib(pName) {
+					ctype = cpb.CapabilityType_CAPABILITY_TYPE_TRANSITIVE
+				}
+				incomingEdge = nodes[v].edge
+				if incomingEdge == nil {
+					break
+				}
+				v = incomingEdge.GetCallee()
+			}
+			c.CapabilityType = &ctype
+			var b strings.Builder
+			for i, p := range c.Path {
+				if i != 0 {
+					b.WriteByte(' ')
+				}
+				b.WriteString(p.GetName())
+			}
+			c.DepPath = proto.String(b.String())
+			caps = append(caps, output{&c, v0})
+		})
+	sort.Slice(caps, func(i, j int) bool {
+		if x, y := caps[i].CapabilityInfo.GetCapability(), caps[j].CapabilityInfo.GetCapability(); x != y {
+			return x < y
+		}
+		return caps[i].Function < caps[j].Function
+	})
+	if config.Granularity == GranularityPackage {
+		// Keep only the first entry in the sorted list for each (capability, package) pair.
+		type cp struct {
+			cpb.Capability
+			Package string
+		}
+		seen := make(map[cp]struct{})
+		// del returns true if the capability and package of o have been seen before.
+		del := func(o output) bool {
+			cp := cp{o.CapabilityInfo.GetCapability(), graph.Functions[o.Function].GetPackage()}
+			if _, ok := seen[cp]; ok {
+				return true
+			}
+			seen[cp] = struct{}{}
+			return false
+		}
+		caps = slices.DeleteFunc(caps, del)
+	}
+	cil := &cpb.CapabilityInfoList{
+		CapabilityInfo: make([]*cpb.CapabilityInfo, len(caps)),
 	}
 	for i := range caps {
 		cil.CapabilityInfo[i] = caps[i].CapabilityInfo
@@ -778,6 +886,185 @@ func forEachPath(pkgs []*packages.Package, queriedPackages map[*types.Package]st
 			}
 		}
 	}
+}
+
+func forEachPath2(g *cpb.Graph, queriedPackages map[string]struct{}, fn func(cpb.Capability, bfsStateMap2, int64)) {
+	safe := map[int64]struct{}{}
+	allNodesWithExplicitCapability := map[int64]struct{}{}
+	nodesByCapability := make(map[cpb.Capability]map[int64]struct{})
+	for _, c := range g.Capabilities {
+		cap := c.GetCapability()
+		fn := c.GetFunction()
+		if cap == cpb.Capability_CAPABILITY_SAFE {
+			safe[fn] = struct{}{}
+			continue
+		}
+		if !c.GetImplicit() {
+			allNodesWithExplicitCapability[fn] = struct{}{}
+		}
+		m, ok := nodesByCapability[cap]
+		if !ok {
+			m = make(map[int64]struct{})
+			nodesByCapability[cap] = m
+		}
+		m[fn] = struct{}{}
+	}
+	var caps []cpb.Capability
+	for cap := range nodesByCapability {
+		caps = append(caps, cap)
+	}
+	slices.Sort(caps)
+
+	adj := make([][]*cpb.Graph_Call, len(g.Functions))
+	for _, edge := range g.Calls {
+		adj[edge.GetCallee()] = append(adj[edge.GetCallee()], edge)
+	}
+
+	for _, cap := range caps {
+		nodes := nodesByCapability[cap]
+		var (
+			visited = make(bfsStateMap2)
+			q       []int64 // queue for the BFS
+		)
+		// Initialize the queue to contain the nodes with the capability.
+		for v := range nodes {
+			if _, ok := safe[v]; ok {
+				continue
+			}
+			q = append(q, v)
+			visited[v] = bfsState2{}
+		}
+		sort.Slice(q, func(x, y int) bool { return compareGraphFunctions(g, q[x], q[y]) })
+		for _, v := range q {
+			if _, ok := queriedPackages[g.Functions[v].GetPackage()]; ok {
+				// v itself is in one of the queried packages.  Call fn here because
+				// the BFS below will only call fn for functions that call v
+				// directly or transitively.
+				fn(cap, visited, v)
+			}
+		}
+		// Perform a BFS backwards through the call graph from the interesting
+		// nodes.
+		for len(q) > 0 {
+			v := q[0]
+			q = q[1:]
+			var incomingEdges []*cpb.Graph_Call
+			for _, edge := range adj[v] {
+				incomingEdges = append(incomingEdges, edge)
+			}
+			sort.Slice(incomingEdges, func(x, y int) bool {
+				return compareGraphFunctions(g, incomingEdges[x].GetCaller(), incomingEdges[y].GetCaller())
+			})
+			for _, edge := range incomingEdges {
+				w := edge.GetCaller()
+				if _, ok := safe[w]; ok {
+					continue
+				}
+				if _, ok := visited[w]; ok {
+					// We have already visited w.
+					continue
+				}
+				if _, ok := allNodesWithExplicitCapability[w]; ok {
+					// w already has an explicit categorization.
+					continue
+				}
+				visited[w] = bfsState2{edge: edge}
+				q = append(q, w)
+				if _, ok := queriedPackages[g.Functions[w].GetPackage()]; ok {
+					fn(cap, visited, w)
+				}
+			}
+		}
+	}
+}
+
+func compareGraphFunctions(g *cpb.Graph, x, y int64) bool {
+	a := g.Functions[x]
+	b := g.Functions[y]
+	if c := strings.Compare(a.GetPackage(), b.GetPackage()); c != 0 {
+		return c < 0
+	}
+	if ar, br := strings.Contains(a.GetName(), "("), strings.Contains(b.GetName(), "("); !ar && br {
+		return true
+	} else if ar && !br {
+		return false
+	}
+	return a.GetName() < b.GetName()
+}
+
+func ExportGraph(pkgs []*packages.Package, config *Config) *cpb.Graph {
+	graph, ssaProg, allFunctions := buildGraph(pkgs, true)
+	unsafePointerFunctions := findUnsafePointerConversions(pkgs, ssaProg, allFunctions)
+	ssaProg = nil // possibly save memory; we don't use ssaProg again
+	safe, nodesByCapability := getNodeCapabilities(graph, config.Classifier)
+
+	extraNodesByCapability := make(nodesetPerCapability)
+	if !config.DisableBuiltin {
+		extraNodesByCapability = getExtraNodesByCapability(graph, allFunctions, unsafePointerFunctions)
+	}
+	nodesByCapability, allNodesWithExplicitCapability := mergeCapabilities(nodesByCapability, extraNodesByCapability)
+
+	g := new(cpb.Graph)
+	nodeToIndex := make(map[*callgraph.Node]int64)
+	gfnToNode := make(map[*cpb.Graph_Function]*callgraph.Node)
+	for fn, node := range graph.Nodes {
+		idx := int64(len(g.Functions))
+		nodeToIndex[node] = idx
+		p := ""
+		if pkg := nodeToPackage(node); pkg != nil {
+			p = pkg.Path()
+		}
+		gfn := &cpb.Graph_Function{
+			Name:    proto.String(fn.String()),
+			Package: proto.String(p),
+		}
+		gfnToNode[gfn] = node
+		g.Functions = append(g.Functions, gfn)
+		add := func(c cpb.Capability, implicit bool) {
+			g.Capabilities = append(g.Capabilities, &cpb.Graph_FunctionCapability{
+				Function:   proto.Int64(idx),
+				Capability: c.Enum(),
+				Implicit:   proto.Bool(implicit),
+			})
+		}
+		if _, ok := safe[node]; ok {
+			add(cpb.Capability_CAPABILITY_SAFE, false)
+		}
+		for c, m := range nodesByCapability {
+			if _, ok := m[node]; ok {
+				_, explicit := allNodesWithExplicitCapability[node]
+				add(c, !explicit)
+			}
+		}
+	}
+	for _, node := range graph.Nodes {
+		idx, ok := nodeToIndex[node]
+		if !ok {
+			continue
+		}
+		for _, e := range node.Out {
+			if !config.Classifier.IncludeCall(e) {
+				continue
+			}
+			idx2, ok := nodeToIndex[e.Callee]
+			if !ok {
+				continue
+			}
+			edge := cpb.Graph_Call{
+				Caller: proto.Int64(idx),
+				Callee: proto.Int64(idx2),
+			}
+			if position := callsitePosition(e); position.IsValid() {
+				edge.CallSite = &cpb.Graph_Site{
+					Filename: proto.String(path.Base(position.Filename)),
+					Line:     proto.Int64(int64(position.Line)),
+					Column:   proto.Int64(int64(position.Column)),
+				}
+			}
+			g.Calls = append(g.Calls, &edge)
+		}
+	}
+	return g
 }
 
 // intermediatePackages returns a CapabilityInfo for each unique (P, C) pair

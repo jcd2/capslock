@@ -31,6 +31,34 @@ message CapabilityInfo {
   optional CapabilityType capability_type = 5;
 }
 
+message Graph {
+  message Function {
+    optional string name = 1;
+    optional string package = 2;
+  }
+  repeated Function functions = 1;
+
+  message Site {
+    optional string filename = 1;
+    optional int64 line = 2;
+    optional int64 column = 3;
+  }
+  message Call {
+    optional int64 caller = 1;
+    optional int64 callee = 2;
+    optional Site call_site = 3;
+  }
+  repeated Call calls = 2;
+
+  message FunctionCapability {
+    optional int64 function = 1;
+    optional Capability capability = 2;
+    optional bool implicit = 3;
+   }
+   repeated FunctionCapability capabilities = 3;
+}
+
+
 message Function {
   optional string name = 1;
 

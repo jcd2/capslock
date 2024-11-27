@@ -16,6 +16,7 @@ import (
 	"text/template"
 
 	"github.com/fatih/color"
+	cpb "github.com/google/capslock/proto"
 	"golang.org/x/tools/go/packages"
 	"google.golang.org/protobuf/encoding/protojson"
 )
@@ -45,6 +46,30 @@ func RunCapslock(args []string, output string, pkgs []*packages.Package, queried
 			return DifferenceFoundError{}
 		}
 		return nil
+	} else if output == "import" {
+		if len(args) != 1 {
+			return fmt.Errorf("Usage: %s -output=import <filename>; provided %v args", programName(), len(args))
+		}
+		data, err := os.ReadFile(args[0])
+		if err != nil {
+			return err
+		}
+		graph := new(cpb.Graph)
+		err = protojson.Unmarshal(data, graph)
+		if err != nil {
+			return err
+		}
+		queriedPackages := make(map[string]struct{})
+		for _, p := range config.Packages {
+			queriedPackages[p] = struct{}{}
+		}
+		cil := GetCapabilityInfoFromImportedGraph(graph, queriedPackages, config)
+		b, err := protojson.MarshalOptions{Multiline: true, Indent: "\t"}.Marshal(cil)
+		if err != nil {
+			return fmt.Errorf("internal error: couldn't marshal protocol buffer: %s", err.Error())
+		}
+		fmt.Println(string(b))
+		return nil
 	} else if len(args) >= 1 {
 		return fmt.Errorf("%s: unknown command", args)
 	}
@@ -54,6 +79,14 @@ func RunCapslock(args []string, output string, pkgs []*packages.Package, queried
 	if output == "json" || output == "j" {
 		cil := GetCapabilityInfo(pkgs, queriedPackages, config)
 		b, err := protojson.MarshalOptions{Multiline: true, Indent: "\t"}.Marshal(cil)
+		if err != nil {
+			return fmt.Errorf("internal error: couldn't marshal protocol buffer: %s", err.Error())
+		}
+		fmt.Println(string(b))
+		return nil
+	} else if output == "export" {
+		g := ExportGraph(pkgs, config)
+		b, err := protojson.MarshalOptions{Multiline: true, Indent: "\t"}.Marshal(g)
 		if err != nil {
 			return fmt.Errorf("internal error: couldn't marshal protocol buffer: %s", err.Error())
 		}

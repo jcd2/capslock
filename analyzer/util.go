@@ -29,10 +29,17 @@ type bfsState struct {
 	// interesting function.
 	edge *callgraph.Edge
 }
+type bfsState2 struct {
+	// edge is the callgraph edge leading to the next node in a path to an
+	// interesting function.
+	edge *cpb.Graph_Call
+}
 
 // bfsStateMap represents the state of a BFS search, and can be used to trace
 // paths from the initial nodes of the search to any other node reached.
 type bfsStateMap map[*callgraph.Node]bfsState
+
+type bfsStateMap2 map[int64]bfsState2
 
 // next returns the next node in the path to an interesting function.
 func (b bfsState) next() *callgraph.Node {

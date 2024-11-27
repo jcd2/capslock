@@ -15,6 +15,7 @@ package main
 import (
 	"flag"
 	"fmt"
+	"go/types"
 	"log"
 	"os"
 	"runtime"
@@ -99,33 +100,40 @@ func run() error {
 		classifier = analyzer.GetClassifier(*noiseFlag)
 	}
 
-	pkgs, err := analyzer.LoadPackages(packageNames,
-		analyzer.LoadConfig{
-			BuildTags: *buildTags,
-			GOOS:      *goos,
-			GOARCH:    *goarch,
-		})
-	if err != nil {
-		return fmt.Errorf("Error loading packages: %w", err)
-	}
-	if len(pkgs) == 0 {
-		return fmt.Errorf("No packages matching %v", packageNames)
-	}
+	var (
+		queriedPackages map[*types.Package]struct{}
+		pkgs            []*packages.Package
+	)
 
-	queriedPackages := analyzer.GetQueriedPackages(pkgs)
-	if *verbose > 0 {
-		for _, p := range pkgs {
-			log.Printf("Loaded package %q\n", p.Name)
+	if *output != "import" {
+		pkgs, err = analyzer.LoadPackages(packageNames,
+			analyzer.LoadConfig{
+				BuildTags: *buildTags,
+				GOOS:      *goos,
+				GOARCH:    *goarch,
+			})
+		if err != nil {
+			return fmt.Errorf("Error loading packages: %w", err)
 		}
-	}
-	if packages.PrintErrors(pkgs) > 0 {
-		return fmt.Errorf("Some packages had errors. Aborting analysis.")
+		if len(pkgs) == 0 {
+			return fmt.Errorf("No packages matching %v", packageNames)
+		}
+		queriedPackages = analyzer.GetQueriedPackages(pkgs)
+		if *verbose > 0 {
+			for _, p := range pkgs {
+				log.Printf("Loaded package %q\n", p.Name)
+			}
+		}
+		if packages.PrintErrors(pkgs) > 0 {
+			return fmt.Errorf("Some packages had errors. Aborting analysis.")
+		}
 	}
 	err = analyzer.RunCapslock(flag.Args(), *output, pkgs, queriedPackages, &analyzer.Config{
 		Classifier:     classifier,
 		DisableBuiltin: *disableBuiltin,
 		Granularity:    g,
 		CapabilitySet:  cs,
+		Packages:       packageNames,
 	})
 
 	if *memprofile != "" {
