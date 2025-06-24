@@ -35,7 +35,7 @@ func C() { println(os.IsExist(nil)) }
 `}
 
 // setup contains common code for loading test packages.
-func setup(filemap map[string]string, pkg string) (pkgs []*packages.Package, queriedPackages map[*types.Package]struct{}, cleanup func(), err error) {
+func setup(filemap map[string]string, pkg ...string) (pkgs []*packages.Package, queriedPackages map[*types.Package]struct{}, cleanup func(), err error) {
 	dir, cleanup, err := analysistest.WriteFiles(filemap)
 	if err != nil {
 		return nil, nil, cleanup, fmt.Errorf("analysistest.WriteFiles: %w", err)
@@ -46,7 +46,7 @@ func setup(filemap map[string]string, pkg string) (pkgs []*packages.Package, que
 		Dir:  dir,
 		Env:  append(os.Environ(), env...),
 	}
-	pkgs, err = packages.Load(cfg, pkg)
+	pkgs, err = packages.Load(cfg, pkg...)
 	if err != nil {
 		return nil, nil, cleanup, fmt.Errorf("packages.Load: %w", err)
 	}
@@ -684,5 +684,167 @@ func TestAlias(t *testing.T) {
 	}
 	if diff := cmp.Diff(expected, cil, opts...); diff != "" {
 		t.Errorf("GetCapabilityInfo: got %v, want %v; diff %s", cil, expected, diff)
+	}
+}
+
+// TestWrappers tests the analyzer on various types of synthetic wrapper functions.
+func TestWrappers(t *testing.T) {
+	filemap := map[string]string{
+		"p1/p1.go": `package p1; import "p2"
+type Embedder struct { p2.Foo }
+var I interface { M(); PM() } = new(Embedder)
+
+func CallPromotedMethod() { I.M() }
+func CallPromotedPointerMethod() { I.PM() }
+
+func CallPointerReceiverWrapper() {
+	f := (*p2.Foo).M
+	x := new(p2.Foo)
+	f(x)
+}
+
+func CallMethodValue() {
+	var x p2.Foo
+	f := x.M
+	f()
+}
+
+func CallMethodExpression() {
+	f := p2.Foo.M
+	var x p2.Foo
+	f(x)
+}
+`,
+		"p2/p2.go": `package p2
+type Foo struct {}
+
+func (f Foo) M() { Interesting() }
+func (f *Foo) PM() { Interesting() }
+
+func Interesting() {}
+`,
+	}
+	classifier := testClassifier{
+		functions: map[[2]string]cpb.Capability{
+			{"p2", "p2.Interesting"}: cpb.Capability_CAPABILITY_FILES,
+		},
+		ignoredEdges: nil,
+	}
+	pkgs, queriedPackages, cleanup, err := setup(filemap, "p1", "p2")
+	if cleanup != nil {
+		defer cleanup()
+	}
+	if err != nil {
+		t.Fatalf("setup: %v", err)
+	}
+	expected := &cpb.CapabilityInfoList{
+		CapabilityInfo: []*cpb.CapabilityInfo{
+			{
+				PackageName: proto.String("p1"),
+				Capability:  cpb.Capability_CAPABILITY_FILES.Enum(),
+				Path: []*cpb.Function{
+					&cpb.Function{Name: proto.String("p1.CallMethodExpression"), Package: proto.String("p1")},
+					&cpb.Function{Name: proto.String("(p2.Foo).M$thunk"), Package: proto.String("p2")},
+					&cpb.Function{Name: proto.String("(p2.Foo).M"), Package: proto.String("p2")},
+					&cpb.Function{Name: proto.String("p2.Interesting"), Package: proto.String("p2")},
+				},
+				PackageDir: proto.String("p1"),
+			},
+			{
+				PackageName: proto.String("p1"),
+				Capability:  cpb.Capability_CAPABILITY_FILES.Enum(),
+				Path: []*cpb.Function{
+					&cpb.Function{Name: proto.String("p1.CallMethodValue"), Package: proto.String("p1")},
+					&cpb.Function{Name: proto.String("(p2.Foo).M$bound"), Package: proto.String("p2")},
+					&cpb.Function{Name: proto.String("(p2.Foo).M"), Package: proto.String("p2")},
+					&cpb.Function{Name: proto.String("p2.Interesting"), Package: proto.String("p2")},
+				},
+				PackageDir: proto.String("p1"),
+			},
+			{
+				PackageName: proto.String("p1"),
+				Capability:  cpb.Capability_CAPABILITY_FILES.Enum(),
+				Path: []*cpb.Function{
+					&cpb.Function{Name: proto.String("p1.CallPointerReceiverWrapper"), Package: proto.String("p1")},
+					&cpb.Function{Name: proto.String("(*p2.Foo).M$thunk"), Package: proto.String("p2")},
+					&cpb.Function{Name: proto.String("(p2.Foo).M"), Package: proto.String("p2")},
+					&cpb.Function{Name: proto.String("p2.Interesting"), Package: proto.String("p2")},
+				},
+				PackageDir: proto.String("p1"),
+			},
+			{
+				PackageName: proto.String("p1"),
+				Capability:  cpb.Capability_CAPABILITY_FILES.Enum(),
+				Path: []*cpb.Function{
+					&cpb.Function{Name: proto.String("p1.CallPromotedMethod"), Package: proto.String("p1")},
+					&cpb.Function{Name: proto.String("(*p1.Embedder).M"), Package: proto.String("p1")},
+					&cpb.Function{Name: proto.String("(p2.Foo).M"), Package: proto.String("p2")},
+					&cpb.Function{Name: proto.String("p2.Interesting"), Package: proto.String("p2")},
+				},
+				PackageDir: proto.String("p1"),
+			},
+			{
+				PackageName: proto.String("p1"),
+				Capability:  cpb.Capability_CAPABILITY_FILES.Enum(),
+				Path: []*cpb.Function{
+					&cpb.Function{Name: proto.String("p1.CallPromotedPointerMethod"), Package: proto.String("p1")},
+					&cpb.Function{Name: proto.String("(*p1.Embedder).PM"), Package: proto.String("p1")},
+					&cpb.Function{Name: proto.String("(*p2.Foo).PM"), Package: proto.String("p2")},
+					&cpb.Function{Name: proto.String("p2.Interesting"), Package: proto.String("p2")},
+				},
+				PackageDir: proto.String("p1"),
+			},
+			{
+				PackageName: proto.String("p2"),
+				Capability:  cpb.Capability_CAPABILITY_FILES.Enum(),
+				Path: []*cpb.Function{
+					&cpb.Function{Name: proto.String("p2.Interesting"), Package: proto.String("p2")},
+				},
+				PackageDir: proto.String("p2"),
+			},
+			{
+				PackageName: proto.String("p2"),
+				Capability:  cpb.Capability_CAPABILITY_FILES.Enum(),
+				Path: []*cpb.Function{
+					&cpb.Function{Name: proto.String("(*p2.Foo).PM"), Package: proto.String("p2")},
+					&cpb.Function{Name: proto.String("p2.Interesting"), Package: proto.String("p2")},
+				},
+				PackageDir: proto.String("p2"),
+			},
+			{
+				PackageName: proto.String("p2"),
+				Capability:  cpb.Capability_CAPABILITY_FILES.Enum(),
+				Path: []*cpb.Function{
+					&cpb.Function{Name: proto.String("(p2.Foo).M"), Package: proto.String("p2")},
+					&cpb.Function{Name: proto.String("p2.Interesting"), Package: proto.String("p2")},
+				},
+				PackageDir: proto.String("p2"),
+			},
+		},
+	}
+
+	got := GetCapabilityInfo(pkgs, queriedPackages, &Config{
+		Classifier:     &classifier,
+		DisableBuiltin: true,
+	})
+	opts := []cmp.Option{
+		protocmp.Transform(),
+		protocmp.SortRepeated(func(a, b *cpb.CapabilityInfo) bool {
+			if u, v := a.GetCapability(), b.GetCapability(); u != v {
+				return u < v
+			}
+			return a.GetPackageDir() < b.GetPackageDir()
+		}),
+		protocmp.IgnoreFields(&cpb.CapabilityInfoList{}, "package_info"),
+		protocmp.IgnoreFields(&cpb.CapabilityInfo{}, "dep_path"),
+		protocmp.IgnoreFields(&cpb.CapabilityInfo{}, "capability_type"),
+		protocmp.IgnoreFields(&cpb.Function{}, "site"),
+		protocmp.IgnoreFields(&cpb.Function_Site{}, "filename"),
+		protocmp.IgnoreFields(&cpb.Function_Site{}, "line"),
+		protocmp.IgnoreFields(&cpb.Function_Site{}, "column"),
+	}
+	if diff := cmp.Diff(expected, got, opts...); diff != "" {
+		t.Errorf("GetCapabilityInfo: got %v, want %v; diff %s",
+			got, expected, diff)
 	}
 }

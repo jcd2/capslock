@@ -779,7 +779,7 @@ func forEachPath(pkgs []*packages.Package, queriedPackages map[*types.Package]st
 				visited[w] = bfsState{edge: edge}
 				q = append(q, w)
 				if w.Func.Package() != nil {
-					if _, ok := queriedPackages[w.Func.Package().Pkg]; ok {
+					if _, ok := queriedPackages[nodeToPackage(w)]; ok {
 						fn(cap, visited, w)
 					}
 				}

@@ -587,8 +587,10 @@ func nodeToPackage(node *callgraph.Node) *types.Package {
 	// Other wrappers.
 	if sig := fn.Signature; sig != nil {
 		if recv := sig.Recv(); recv != nil {
-			if pkg := recv.Pkg(); pkg != nil {
-				return pkg
+			if t := recv.Type(); t != nil {
+				if p := receiverTypePackage(t); p != nil {
+					return p
+				}
 			}
 		}
 	}
