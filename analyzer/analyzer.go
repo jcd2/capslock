@@ -487,86 +487,89 @@ func getPackageNodesWithCapability(pkgs []*packages.Package,
 	graph, ssaProg, allFunctions := buildGraph(pkgs, true)
 	unsafePointerFunctions := findUnsafePointerConversions(pkgs, ssaProg, allFunctions)
 	ssaProg = nil // possibly save memory; we don't use ssaProg again
-	safe, nodesByCapability = getNodeCapabilities(graph, config.Classifier)
+	safe = make(nodeset)
+	nodesByCapability = make(nodesetPerCapability)
+	for f, node := range graph.Nodes {
+		c := getExplicitCapability(f, config.Classifier)
+		if c == cpb.Capability_CAPABILITY_SAFE {
+			safe[node] = struct{}{}
+		} else if c != cpb.Capability_CAPABILITY_UNSPECIFIED {
+			nodesByCapability.add(c, node)
+		}
+	}
 
 	if !config.DisableBuiltin {
-		extraNodesByCapability = getExtraNodesByCapability(graph, allFunctions, unsafePointerFunctions)
+		extraNodesByCapability = make(nodesetPerCapability)
+		for f, node := range graph.Nodes {
+			if usesReflect(f) {
+				extraNodesByCapability.add(cpb.Capability_CAPABILITY_REFLECT, node)
+			}
+			if noSource(f) {
+				extraNodesByCapability.add(cpb.Capability_CAPABILITY_ARBITRARY_EXECUTION, node)
+			}
+			if _, ok := unsafePointerFunctions[f]; ok {
+				extraNodesByCapability.add(cpb.Capability_CAPABILITY_UNSAFE_POINTER, node)
+			}
+		}
 	}
 	return safe, nodesByCapability, extraNodesByCapability
 }
 
-func getExtraNodesByCapability(graph *callgraph.Graph, allFunctions map[*ssa.Function]bool, unsafePointerFunctions map[*ssa.Function]struct{}) nodesetPerCapability {
-	// Find functions that copy reflect.Value objects in a way that could
-	// possibly cause a data race, and add their nodes to
-	// extraNodesByCapability[Capability_CAPABILITY_REFLECT].
-	extraNodesByCapability := make(nodesetPerCapability)
-	for f := range allFunctions {
-		// Find the function variables that do not escape.
-		locals := map[ssa.Value]struct{}{}
-		for _, l := range f.Locals {
-			if !l.Heap {
-				locals[l] = struct{}{}
-			}
+// usesReflect determines if fn copies reflect.Value objects in a way that could
+// possibly cause type confusion.
+func usesReflect(f *ssa.Function) bool {
+	// Find the function variables that do not escape.
+	locals := map[ssa.Value]struct{}{}
+	for _, l := range f.Locals {
+		if !l.Heap {
+			locals[l] = struct{}{}
 		}
-		for _, b := range f.Blocks {
-			for _, i := range b.Instrs {
-				// An IndexAddr instruction creates an SSA value which refers to an
-				// element of an array.  An element of a local array is also local.
-				if ia, ok := i.(*ssa.IndexAddr); ok {
-					if _, islocal := locals[ia.X]; islocal {
-						locals[ia] = struct{}{}
-					}
+	}
+	for _, b := range f.Blocks {
+		for _, i := range b.Instrs {
+			// An IndexAddr instruction creates an SSA value which refers to an
+			// element of an array.  An element of a local array is also local.
+			if ia, ok := i.(*ssa.IndexAddr); ok {
+				if _, islocal := locals[ia.X]; islocal {
+					locals[ia] = struct{}{}
 				}
-				// A FieldAddr instruction creates an SSA value which refers to a
-				// field of a struct.  A field of a local struct is also local.
-				if f, ok := i.(*ssa.FieldAddr); ok {
-					if _, islocal := locals[f.X]; islocal {
-						locals[f] = struct{}{}
-					}
+			}
+			// A FieldAddr instruction creates an SSA value which refers to a
+			// field of a struct.  A field of a local struct is also local.
+			if f, ok := i.(*ssa.FieldAddr); ok {
+				if _, islocal := locals[f.X]; islocal {
+					locals[f] = struct{}{}
 				}
-				// Check the destination of store instructions.
-				if s, ok := i.(*ssa.Store); ok {
-					dest := s.Addr
-					if _, islocal := locals[dest]; islocal {
-						continue
-					}
-					// dest.Type should be a types.Pointer pointing to the type of the
-					// value that is copied by this instruction.
-					typ, ok := types.Unalias(dest.Type()).(*types.Pointer)
-					if !ok {
-						continue
-					}
-					if !containsReflectValue(typ.Elem()) {
-						continue
-					}
-					if node, ok := graph.Nodes[f]; ok {
-						// This is a store to a non-local reflect.Value, or to a non-local
-						// object that contains a reflect.Value.
-						extraNodesByCapability.add(cpb.Capability_CAPABILITY_REFLECT, node)
-					}
+			}
+			// Check the destination of store instructions.
+			if s, ok := i.(*ssa.Store); ok {
+				dest := s.Addr
+				if _, islocal := locals[dest]; islocal {
+					continue
 				}
+				// dest.Type should be a types.Pointer pointing to the type of the
+				// value that is copied by this instruction.
+				typ, ok := types.Unalias(dest.Type()).(*types.Pointer)
+				if !ok {
+					continue
+				}
+				if !containsReflectValue(typ.Elem()) {
+					continue
+				}
+				// This is a store to a non-local reflect.Value, or to a non-local
+				// object that contains a reflect.Value.
+				return true
 			}
 		}
 	}
-	// Add nodes for the functions in unsafePointerFunctions to
-	// extraNodesByCapability[Capability_CAPABILITY_UNSAFE_POINTER].
-	for f := range unsafePointerFunctions {
-		if node, ok := graph.Nodes[f]; ok {
-			extraNodesByCapability.add(cpb.Capability_CAPABILITY_UNSAFE_POINTER, node)
-		}
-	}
-	// Add the arbitrary-execution capability to asm function nodes.
-	for f, node := range graph.Nodes {
-		if f.Blocks == nil {
-			// No source code for this function.
-			if f.Synthetic != "" {
-				// Exclude synthetic functions, such as those loaded from object files.
-				continue
-			}
-			extraNodesByCapability.add(cpb.Capability_CAPABILITY_ARBITRARY_EXECUTION, node)
-		}
-	}
-	return extraNodesByCapability
+	return false
+}
+
+// noSource returns whether f has no source available, e.g. assembly and
+// linkname functions.
+func noSource(f *ssa.Function) bool {
+	// Exclude synthetic functions, such as those loaded from object files.
+	return f != nil && f.Blocks == nil && f.Synthetic == ""
 }
 
 // findUnsafePointerConversions uses analysis of the syntax tree to find
@@ -623,40 +626,25 @@ func findUnsafePointerConversions(pkgs []*packages.Package, ssaProg *ssa.Program
 	return unsafePointerFunctions
 }
 
-func getNodeCapabilities(graph *callgraph.Graph,
-	classifier Classifier,
-) (safe nodeset, nodesByCapability nodesetPerCapability) {
-	safe = make(nodeset)
-	nodesByCapability = make(nodesetPerCapability)
-	for _, v := range graph.Nodes {
-		if v.Func == nil {
-			continue
-		}
-		var c cpb.Capability
-		if v.Func.Package() != nil && v.Func.Package().Pkg != nil {
-			// Categorize v.Func.
-			pkg := v.Func.Package().Pkg.Path()
-			name := v.Func.String()
-			c = classifier.FunctionCategory(pkg, name)
-		} else {
-			origin := v.Func.Origin()
-			if origin == nil || origin.Package() == nil || origin.Package().Pkg == nil {
-				continue
-			}
-			// v.Func is an instantiation of a generic function.  Get the package
-			// name and function name of the generic function, and categorize that
-			// instead.
-			pkg := origin.Package().Pkg.Path()
-			name := origin.String()
-			c = classifier.FunctionCategory(pkg, name)
-		}
-		if c == cpb.Capability_CAPABILITY_SAFE {
-			safe[v] = struct{}{}
-		} else if c != cpb.Capability_CAPABILITY_UNSPECIFIED {
-			nodesByCapability.add(c, v)
-		}
+func getExplicitCapability(fn *ssa.Function, classifier Classifier) cpb.Capability {
+	if fn == nil {
+		return cpb.Capability_CAPABILITY_UNSPECIFIED
 	}
-	return safe, nodesByCapability
+	if fn.Package() != nil && fn.Package().Pkg != nil {
+		pkg := fn.Package().Pkg.Path()
+		name := fn.String()
+		return classifier.FunctionCategory(pkg, name)
+	}
+	origin := fn.Origin()
+	if origin == nil || origin.Package() == nil || origin.Package().Pkg == nil {
+		return cpb.Capability_CAPABILITY_UNSPECIFIED
+	}
+	// fn is an instantiation of a generic function.  Get the package
+	// name and function name of the generic function, and categorize that
+	// instead.
+	pkg := origin.Package().Pkg.Path()
+	name := origin.String()
+	return classifier.FunctionCategory(pkg, name)
 }
 
 func mergeCapabilities(nodesByCapability, extraNodesByCapability nodesetPerCapability) (nodesetPerCapability, nodeset) {
