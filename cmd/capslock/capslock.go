@@ -17,6 +17,7 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"io"
 	"log"
 	"os"
 	"os/exec"
@@ -26,11 +27,15 @@ import (
 
 	"github.com/google/capslock/analyzer"
 	"github.com/google/capslock/interesting"
+	cpb "github.com/google/capslock/proto"
 	"golang.org/x/tools/go/packages"
+	"google.golang.org/protobuf/encoding/protojson"
 )
 
 var (
 	packageList    = flag.String("packages", "", "target patterns to be analysed; allows wildcarding")
+	importFlag     = flag.String("import", "", `file containing callgraph and capability information to import.  If "-", reads from standard input.  If unset, the Go packages specified in -packages are loaded.`)
+	exportFlag     = flag.Bool("export", false, "load Go packages specified in -packages, and just output the callgraph and function capability annotations, without analyzing them.")
 	output         = flag.String("output", "", "output mode to use; non-default options are json, m, v, graph, and compare")
 	verbose        = flag.Int("v", 0, "verbosity level")
 	noiseFlag      = flag.Bool("noisy", false, "include output on unanalyzed function calls (can be noisy)")
@@ -74,7 +79,6 @@ func run() error {
 		defer pprof.StopCPUProfile()
 	}
 
-	packageNames := strings.Split(*packageList, ",")
 	g, err := analyzer.GranularityFromString(*granularity)
 	if err != nil {
 		return fmt.Errorf("parsing flag -granularity: %w", err)
@@ -104,80 +108,111 @@ func run() error {
 		classifier = analyzer.GetClassifier(*noiseFlag)
 	}
 
-	loadConfig := analyzer.LoadConfig{
-		BuildTags: *buildTags,
-		GOOS:      *goos,
-		GOARCH:    *goarch,
-	}
-	pkgs, listFailed, failedPackage, err := loadPackages(packageNames, loadConfig)
-	if (listFailed || len(pkgs) == 0) && !*forceLocalModule {
-		// Either:
-		// - `go list` returned an error for one of the packages, perhaps because
-		//   it is not a dependency of the current workspace; or
-		// - no packages were loaded, because paths with '...' wildcards matched
-		//   no dependencies of the current workspace.
-		//
-		// Here we try again in a temporary module, in which we call `go get` for
-		// each package.
-		//
-		// -force_local_module disables this behavior, and returns an error
-		// instead.
-		if listFailed {
-			fmt.Fprintf(os.Stderr, "Couldn't load package %q in the current module.", failedPackage)
-		} else {
-			fmt.Fprintf(os.Stderr, "Found no packages matching %q in the current module.", packageNames)
-		}
-		fmt.Fprintf(os.Stderr, "  Trying again in a temporary module.\n")
-
-		// Save current working directory.
-		var wd string
-		wd, err = os.Getwd()
-		if err != nil {
-			return err
-		}
-
-		// Create a temporary module, switch to it, and `go get` the requested packages.
-		var remove func()
-		remove, err = makeTemporaryModule(packageNames)
-		if remove != nil {
-			defer remove()
-		}
-		if err != nil {
-			return err
-		}
-
-		// Try loading the packages again.
-		pkgs, _, _, err = loadPackages(packageNames, loadConfig)
-
-		// Switch back to the original working directory.
-		err1 := os.Chdir(wd)
-		if err == nil && err1 != nil {
-			return fmt.Errorf("returning to working directory: %w", err1)
-		}
-	}
-	if err != nil {
-		return fmt.Errorf("Error loading packages: %w", err)
-	}
-	if len(pkgs) == 0 {
-		return fmt.Errorf("No packages matching %v", packageNames)
-	}
-
-	queriedPackages := analyzer.GetQueriedPackages(pkgs)
-	if *verbose > 0 {
-		for _, p := range pkgs {
-			log.Printf("Loaded package %q\n", p.Name)
-		}
-	}
-	if printErrors(pkgs) {
-		return fmt.Errorf("Some packages had errors. Aborting analysis.")
-	}
-	err = analyzer.RunCapslock(flag.Args(), *output, pkgs, queriedPackages, &analyzer.Config{
+	var graph *cpb.Graph
+	config := &analyzer.Config{
 		Classifier:     classifier,
 		DisableBuiltin: *disableBuiltin,
 		Granularity:    g,
 		CapabilitySet:  cs,
 		OmitPaths:      *omitPaths,
-	})
+	}
+	if *importFlag != "" {
+		var (
+			data []byte
+			err  error
+		)
+		if *importFlag == "-" {
+			data, err = io.ReadAll(os.Stdin)
+		} else {
+			data, err = os.ReadFile(*importFlag)
+		}
+		if err != nil {
+			return err
+		}
+		graph = new(cpb.Graph)
+		if err := protojson.Unmarshal(data, graph); err != nil {
+			return err
+		}
+	} else {
+		packageNames := strings.Split(*packageList, ",")
+		loadConfig := analyzer.LoadConfig{
+			BuildTags: *buildTags,
+			GOOS:      *goos,
+			GOARCH:    *goarch,
+		}
+		pkgs, listFailed, failedPackage, err := loadPackages(packageNames, loadConfig)
+		if (listFailed || len(pkgs) == 0) && !*forceLocalModule {
+			// Either:
+			// - `go list` returned an error for one of the packages, perhaps because
+			//   it is not a dependency of the current workspace; or
+			// - no packages were loaded, because paths with '...' wildcards matched
+			//   no dependencies of the current workspace.
+			//
+			// Here we try again in a temporary module, in which we call `go get` for
+			// each package.
+			//
+			// -force_local_module disables this behavior, and returns an error
+			// instead.
+			if listFailed {
+				fmt.Fprintf(os.Stderr, "Couldn't load package %q in the current module.", failedPackage)
+			} else {
+				fmt.Fprintf(os.Stderr, "Found no packages matching %q in the current module.", packageNames)
+			}
+			fmt.Fprintf(os.Stderr, "  Trying again in a temporary module.\n")
+
+			// Save current working directory.
+			var wd string
+			wd, err = os.Getwd()
+			if err != nil {
+				return err
+			}
+
+			// Create a temporary module, switch to it, and `go get` the requested packages.
+			var remove func()
+			remove, err = makeTemporaryModule(packageNames)
+			if remove != nil {
+				defer remove()
+			}
+			if err != nil {
+				return err
+			}
+
+			// Try loading the packages again.
+			pkgs, _, _, err = loadPackages(packageNames, loadConfig)
+
+			// Switch back to the original working directory.
+			err1 := os.Chdir(wd)
+			if err == nil && err1 != nil {
+				return fmt.Errorf("returning to working directory: %w", err1)
+			}
+		}
+		if err != nil {
+			return fmt.Errorf("Error loading packages: %w", err)
+		}
+		if len(pkgs) == 0 {
+			return fmt.Errorf("No packages matching %v", packageNames)
+		}
+
+		if *verbose > 0 {
+			for _, p := range pkgs {
+				log.Printf("Loaded package %q\n", p.Name)
+			}
+		}
+		if printErrors(pkgs) {
+			return fmt.Errorf("Some packages had errors. Aborting analysis.")
+		}
+		graph = analyzer.ExportGraph(pkgs, config)
+	}
+	if *exportFlag {
+		var b []byte
+		b, err = protojson.MarshalOptions{Multiline: true, Indent: "\t"}.Marshal(graph)
+		if err != nil {
+			return fmt.Errorf("internal error: couldn't marshal protocol buffer: %s", err.Error())
+		}
+		_, err = fmt.Println(string(b))
+	} else {
+		err = analyzer.RunCapslock(flag.Args(), *output, graph, config)
+	}
 
 	if *memprofile != "" {
 		f, err := os.Create(*memprofile)

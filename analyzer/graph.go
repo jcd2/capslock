@@ -9,15 +9,11 @@ package analyzer
 import (
 	"bufio"
 	"fmt"
-	"go/types"
 	"io"
 	"os"
-	"strconv"
 	"strings"
 
 	cpb "github.com/google/capslock/proto"
-	"golang.org/x/tools/go/callgraph"
-	"golang.org/x/tools/go/packages"
 )
 
 // CapabilitySet represents a set of Capslock capabilities.
@@ -72,32 +68,29 @@ func NewCapabilitySet(cs string) (*CapabilitySet, error) {
 	return &CapabilitySet{out, negated}, nil
 }
 
-func graphOutput(pkgs []*packages.Package, queriedPackages map[*types.Package]struct{}, config *Config) error {
+func graphOutput(graph *cpb.Graph, config *Config) error {
 	w := bufio.NewWriterSize(os.Stdout, 1<<20)
 	gb := newGraphBuilder(w, func(v interface{}) string {
 		switch v := v.(type) {
-		case *callgraph.Node:
-			if v.Func != nil {
-				return v.Func.String()
-			}
-			return strconv.Itoa(v.ID)
+		case int64:
+			return graph.Functions[v].GetName()
 		case cpb.Capability:
 			return v.String()
 		default:
 			panic("unexpected node type")
 		}
 	})
-	callEdge := func(edge *callgraph.Edge) {
-		gb.Edge(edge.Caller, edge.Callee)
+	callEdge := func(edge *cpb.Graph_Call) {
+		gb.Edge(edge.GetCaller(), edge.GetCallee())
 	}
-	capabilityEdge := func(fn *callgraph.Node, c cpb.Capability) {
+	capabilityEdge := func(fn int64, c cpb.Capability) {
 		gb.Edge(fn, c)
 	}
 	var filter func(c cpb.Capability) bool
 	if config.CapabilitySet != nil {
 		filter = config.CapabilitySet.Has
 	}
-	CapabilityGraph(pkgs, queriedPackages, config, nil, callEdge, capabilityEdge, filter)
+	CapabilityGraph(graph, nil, callEdge, capabilityEdge, filter)
 	gb.Done()
 	return w.Flush()
 }

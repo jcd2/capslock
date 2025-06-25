@@ -7,15 +7,11 @@
 package analyzer
 
 import (
-	"go/types"
 	"os"
-	"path"
-	"sort"
 	"sync"
 
 	cpb "github.com/google/capslock/proto"
 	"golang.org/x/tools/go/packages"
-	"google.golang.org/protobuf/proto"
 )
 
 var (
@@ -46,17 +42,6 @@ const PackagesLoadModeNeeded packages.LoadMode = packages.NeedName |
 	packages.NeedTypesInfo |
 	packages.NeedTypesSizes |
 	packages.NeedModule
-
-// GetQueriedPackages builds a set of *types.Package matching the input query so that
-// we can limit the output to only functions in these packages, not
-// their dependencies too.
-func GetQueriedPackages(pkgs []*packages.Package) map[*types.Package]struct{} {
-	queriedPackages := map[*types.Package]struct{}{}
-	for _, p := range pkgs {
-		queriedPackages[p.Types] = struct{}{}
-	}
-	return queriedPackages
-}
 
 func LoadPackages(packageNames []string, lcfg LoadConfig) ([]*packages.Package, error) {
 	cfg := &packages.Config{Mode: PackagesLoadModeNeeded}
@@ -90,54 +75,21 @@ func standardLibraryPackages() map[string]struct{} {
 	return standardLibraryPackagesMap
 }
 
-func collectModuleInfo(pkgs []*packages.Package) []*cpb.ModuleInfo {
-	pathToModule := make(map[string]*cpb.ModuleInfo)
-	forEachPackageIncludingDependencies(pkgs, func(pkg *packages.Package) {
-		m := pkg.Module
-		if m == nil || m.Path == "" || m.Version == "" {
-			// No module information.
-			return
+func collectModuleInfo(graph *cpb.Graph) []*cpb.ModuleInfo {
+	mi := make([]*cpb.ModuleInfo, len(graph.Modules))
+	for i, m := range graph.Modules {
+		mi[i] = &cpb.ModuleInfo{
+			Path:    m.Name,
+			Version: m.Version,
 		}
-		if _, ok := pathToModule[m.Path]; ok {
-			// We've seen this module.
-			return
-		}
-		pm := new(cpb.ModuleInfo)
-		pm.Path = proto.String(m.Path)
-		pm.Version = proto.String(m.Version)
-		pathToModule[m.Path] = pm
-	})
-	// Sort by path.
-	var modulePaths []string
-	for path := range pathToModule {
-		modulePaths = append(modulePaths, path)
 	}
-	sort.Strings(modulePaths)
-	// Construct the output slice.
-	var modules []*cpb.ModuleInfo
-	for _, path := range modulePaths {
-		modules = append(modules, pathToModule[path])
-	}
-	return modules
+	return mi
 }
 
-func collectPackageInfo(pkgs []*packages.Package) []*cpb.PackageInfo {
-	var out []*cpb.PackageInfo
-	std := standardLibraryPackages()
-	forEachPackageIncludingDependencies(pkgs, func(pkg *packages.Package) {
-		if _, ok := std[pkg.PkgPath]; ok {
-			// Skip this package since it is part of the Go standard library.
-			return
-		}
-		pi := new(cpb.PackageInfo)
-		pi.Path = proto.String(pkg.PkgPath)
-		for _, i := range pkg.IgnoredFiles {
-			pi.IgnoredFiles = append(pi.IgnoredFiles, path.Base(i))
-		}
-		out = append(out, pi)
-	})
-	sort.Slice(out, func(i, j int) bool {
-		return out[i].GetPath() < out[j].GetPath()
-	})
-	return out
+func collectPackageInfo(graph *cpb.Graph) []*cpb.PackageInfo {
+	pi := make([]*cpb.PackageInfo, len(graph.Packages))
+	for i, p := range graph.Packages {
+		pi[i] = &cpb.PackageInfo{Path: p.Path}
+	}
+	return pi
 }

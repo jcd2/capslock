@@ -20,31 +20,22 @@ import (
 	"golang.org/x/tools/go/packages"
 	"golang.org/x/tools/go/ssa"
 	"golang.org/x/tools/go/ssa/ssautil"
-	"google.golang.org/protobuf/proto"
 )
 
 type bfsState struct {
 	// edge is the callgraph edge leading to the next node in a path to an
 	// interesting function.
-	edge *callgraph.Edge
+	edge *cpb.Graph_Call
 }
 
 // bfsStateMap represents the state of a BFS search, and can be used to trace
 // paths from the initial nodes of the search to any other node reached.
-type bfsStateMap map[*callgraph.Node]bfsState
+type bfsStateMap map[int64]bfsState
 
-// next returns the next node in the path to an interesting function.
-func (b bfsState) next() *callgraph.Node {
-	if b.edge == nil {
-		return nil
-	}
-	return b.edge.Callee
-}
-
-type nodeset map[*callgraph.Node]struct{}
+type nodeset map[int64]struct{}
 type nodesetPerCapability map[cpb.Capability]nodeset
 
-func (nc nodesetPerCapability) add(cap cpb.Capability, node *callgraph.Node) {
+func (nc nodesetPerCapability) add(cap cpb.Capability, node int64) {
 	m := nc[cap]
 	if m == nil {
 		m = make(nodeset)
@@ -53,101 +44,90 @@ func (nc nodesetPerCapability) add(cap cpb.Capability, node *callgraph.Node) {
 	m[node] = struct{}{}
 }
 
-// byFunction is a slice of *callgraph.Node that can be sorted using sort.Sort.
-// The ordering is first by package name, then function name.
-type byFunction []*callgraph.Node
-
-func (s byFunction) Len() int { return len(s) }
-func (s byFunction) Less(i, j int) bool {
-	return nodeCompare(s[i], s[j]) < 0
-}
-func (s byFunction) Swap(i, j int) {
-	s[i], s[j] = s[j], s[i]
-}
-
-// byCaller is a slice of *callgraph.Edge that can be sorted using
-// sort.Sort.  It sorts by calling function, then callsite position.
-type byCaller []*callgraph.Edge
-
-func (s byCaller) Len() int { return len(s) }
-func (s byCaller) Less(i, j int) bool {
-	if c := nodeCompare(s[i].Caller, s[j].Caller); c != 0 {
-		return c < 0
-	}
-	return positionLess(callsitePosition(s[i]), callsitePosition(s[j]))
-}
-func (s byCaller) Swap(i, j int) {
-	s[i], s[j] = s[j], s[i]
-}
-
-// byCallee is a slice of *callgraph.Edge that can be sorted using
-// sort.Sort.  It sorts by callee function, then callsite position.
-type byCallee []*callgraph.Edge
-
-func (s byCallee) Len() int { return len(s) }
-func (s byCallee) Less(i, j int) bool {
-	if c := nodeCompare(s[i].Callee, s[j].Callee); c != 0 {
-		return c < 0
-	}
-	return positionLess(callsitePosition(s[i]), callsitePosition(s[j]))
-}
-func (s byCallee) Swap(i, j int) {
-	s[i], s[j] = s[j], s[i]
-}
-
-// nodeCompare orders by package path, then by whether the function is a
-// method, then by name.  Returns {-1, 0, +1} in the manner of strings.Compare.
-func nodeCompare(a, b *callgraph.Node) int {
-	// Put nils last.
-	if a == nil && b == nil {
-		return 0
-	} else if b == nil {
-		return -1
-	} else if a == nil {
-		return +1
-	}
-	pa, pb := nodeToPackage(a), nodeToPackage(b)
-	if pa != nil || pb != nil {
-		if pa == nil {
-			return +1
-		}
-		if pb == nil {
-			return -1
-		}
-		if c := strings.Compare(pa.Path(), pb.Path()); c != 0 {
+func compareEdges(g *cpb.Graph, x, y *cpb.Graph_Call) int {
+	if a, b := x.GetCaller(), y.GetCaller(); a != b {
+		if c := compareFunctions(g, a, b); c != 0 {
 			return c
 		}
 	}
-	hasReceiver := func(f *ssa.Function) bool {
-		sig := f.Signature
-		return sig != nil && sig.Recv() != nil
+	if a, b := x.GetCallee(), y.GetCallee(); a != b {
+		if c := compareFunctions(g, a, b); c != 0 {
+			return c
+		}
 	}
-	if ar, br := hasReceiver(a.Func), hasReceiver(b.Func); !ar && br {
-		return -1
-	} else if ar && !br {
-		return +1
-	}
-	return strings.Compare(a.Func.String(), b.Func.String())
+	return compareSites(x.CallSite, y.CallSite)
 }
 
-// positionLess implements an ordering on token.Position.
-// It orders first by filename, then by position in the file.
-// Invalid positions are sorted last.
-func positionLess(p1, p2 token.Position) bool {
-	if p2.Line == 0 {
-		// A token.Position with Line == 0 is invalid.
-		return p1.Line != 0
+// compareBool performs a three-way comparison between two bool values.  It returns:
+//
+//	0  if a==b
+//	-1 if a && !b
+//	+1 if !a && b
+func compareBool(a, b bool) int {
+	if a == b {
+		return 0
 	}
-	if p1.Line == 0 {
-		return false
+	if a {
+		return -1
 	}
-	if p1.Filename != p2.Filename {
-		// Note that two positions from the same function can have different
-		// filenames because the ssa.Function for "init" can include
-		// initialization code for package-level variables in multiple files.
-		return p1.Filename < p2.Filename
+	return +1
+}
+
+func compareFunctions(g *cpb.Graph, x, y int64) int {
+	a := g.Functions[x]
+	b := g.Functions[y]
+	return compareFunctionObjects(g, a, b)
+}
+
+func compareFunctionObjects(g *cpb.Graph, a, b *cpb.Graph_Function) int {
+	ap := a.Package
+	bp := b.Package
+	if c := compareBool(ap != nil, bp != nil); c != 0 {
+		return c
 	}
-	return p1.Offset < p2.Offset
+	if ap != nil && bp != nil {
+		if c := strings.Compare(g.Packages[*ap].GetPath(), g.Packages[*bp].GetPath()); c != 0 {
+			return c
+		}
+	}
+	hasReceiver := func(f *cpb.Graph_Function) bool {
+		return f.Type != nil
+	}
+	if c := compareBool(!hasReceiver(a), !hasReceiver(b)); c != 0 {
+		return c
+	}
+	return strings.Compare(a.GetName(), b.GetName())
+}
+
+func compareSites(x, y *cpb.Graph_Site) int {
+	if x == y {
+		return 0
+	}
+	if c := compareBool(x != nil, y != nil); c != 0 {
+		return c
+	}
+	if c := compareBool(x.GetFilename() != "", y.GetFilename() != ""); c != 0 {
+		return c
+	}
+	if c := compareBool(x.GetLine() != 0, y.GetLine() != 0); c != 0 {
+		return c
+	}
+	if c := strings.Compare(x.GetFilename(), y.GetFilename()); c != 0 {
+		return c
+	}
+	compareInt64 := func(a, b int64) int {
+		if a == b {
+			return 0
+		}
+		if a < b {
+			return -1
+		}
+		return +1
+	}
+	if c := compareInt64(x.GetLine(), y.GetLine()); c != 0 {
+		return c
+	}
+	return compareInt64(x.GetColumn(), y.GetColumn())
 }
 
 // callsitePosition returns a token.Position for the edge's callsite.
@@ -165,13 +145,6 @@ func callsitePosition(edge *callgraph.Edge) token.Position {
 	} else {
 		return fset.Position(edge.Pos())
 	}
-}
-
-func isStdLib(p string) bool {
-	if strings.Contains(p, ".") {
-		return false
-	}
-	return true
 }
 
 func buildGraph(pkgs []*packages.Package, populateSyntax bool) (*callgraph.Graph, *ssa.Program, map[*ssa.Function]bool) {
@@ -508,18 +481,20 @@ func programName() string {
 	return "capslock"
 }
 
-// addFunction adds an entry to *fns for the given node and edge.
+// addFunction adds an entry to *fns for the given graph function and call.
 // The edge can be nil.
-func addFunction(fns *[]*cpb.Function, v *callgraph.Node, incomingEdge *callgraph.Edge) {
-	fn := &cpb.Function{Name: proto.String(v.Func.String())}
-	if pkg := nodeToPackage(v); pkg != nil {
-		fn.Package = proto.String(pkg.Path())
+func addFunction(fns *[]*cpb.Function, graph *cpb.Graph, v int64, incomingEdge *cpb.Graph_Call) {
+	fn := &cpb.Function{Name: graph.Functions[v].Name}
+	if p := graph.Functions[v].Package; p != nil {
+		fn.Package = graph.Packages[*p].Path
 	}
-	if position := callsitePosition(incomingEdge); position.IsValid() {
-		fn.Site = &cpb.Function_Site{
-			Filename: proto.String(path.Base(position.Filename)),
-			Line:     proto.Int64(int64(position.Line)),
-			Column:   proto.Int64(int64(position.Column)),
+	if incomingEdge != nil {
+		if s := incomingEdge.CallSite; s != nil {
+			fn.Site = &cpb.Function_Site{
+				Filename: s.Filename,
+				Line:     s.Line,
+				Column:   s.Column,
+			}
 		}
 	}
 	*fns = append(*fns, fn)

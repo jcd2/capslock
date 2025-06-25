@@ -8,13 +8,11 @@ package analyzer
 
 import (
 	"fmt"
-	"go/types"
 	"os"
 	"sort"
 	"text/tabwriter"
 
 	cpb "github.com/google/capslock/proto"
-	"golang.org/x/tools/go/packages"
 	"google.golang.org/protobuf/encoding/protojson"
 )
 
@@ -43,7 +41,7 @@ func GranularityFromString(g string) (Granularity, error) {
 	}
 }
 
-func compare(baselineFilename string, pkgs []*packages.Package, queriedPackages map[*types.Package]struct{}, config *Config) (different bool, err error) {
+func compare(baselineFilename string, graph *cpb.Graph, config *Config) (different bool, err error) {
 	if config.Granularity == GranularityUnset {
 		config.Granularity = GranularityPackage
 	}
@@ -56,7 +54,7 @@ func compare(baselineFilename string, pkgs []*packages.Package, queriedPackages 
 	if err != nil {
 		return false, fmt.Errorf("Comparison file should include output from running `%s -output=j`. Error from parsing comparison file: %v", programName(), err.Error())
 	}
-	cil := GetCapabilityInfo(pkgs, queriedPackages, config)
+	cil := GetCapabilityInfo(graph, config)
 	return diffCapabilityInfoLists(baseline, cil, config.Granularity), nil
 }
 

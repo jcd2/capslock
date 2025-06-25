@@ -9,6 +9,8 @@ package analyzer
 import (
 	"go/ast"
 	"go/types"
+	"maps"
+	"path"
 	"slices"
 	"sort"
 	"strings"
@@ -68,55 +70,62 @@ func GetClassifier(excludeUnanalyzed bool) *interesting.Classifier {
 	return classifier
 }
 
-// GetCapabilityInfo analyzes the packages in pkgs.  It finds functions in
-// those packages that have a path in the callgraph to a function with a
+// GetCapabilityInfo analyzes the input Graph.  It finds functions in
+// the root packages that have a path in the callgraph to a function with a
 // capability.
 //
 // GetCapabilityInfo does not return every possible path (see the function
 // CapabilityGraph for a way to get all paths).  Which entries are returned
 // depends on the value of Config.Granularity:
 //   - For "function" granularity (the default), one CapabilityInfo is returned
-//     for each combination of capability and function in pkgs.
+//     for each combination of capability and root package function.
 //   - For "package" granularity, one CapabilityInfo is returned for each
-//     combination of capability and package in pkgs.
+//     combination of capability and root package.
 //   - For "intermediate" granularity, one CapabilityInfo is returned for each
-//     combination of capability and package that is in a path from a function
-//     in pkgs to a function with a capability.
-func GetCapabilityInfo(pkgs []*packages.Package, queriedPackages map[*types.Package]struct{}, config *Config) *cpb.CapabilityInfoList {
+//     combination of capability and package that is in a path from a root
+//     package function to a function with a capability.
+func GetCapabilityInfo(graph *cpb.Graph, config *Config) *cpb.CapabilityInfoList {
 	if config.Granularity == GranularityUnset {
 		config.Granularity = GranularityFunction
 	}
 	if config.Granularity == GranularityIntermediate {
-		return intermediatePackages(pkgs, queriedPackages, config)
+		return intermediatePackages(graph, config)
 	}
 	type output struct {
 		*cpb.CapabilityInfo
-		*callgraph.Node // used for sorting
+		Function int64 // used for sorting
 	}
 	var caps []output
-	forEachPath(pkgs, queriedPackages,
-		func(cap cpb.Capability, nodes bfsStateMap, v *callgraph.Node) {
+	forEachPath(graph,
+		func(cap cpb.Capability, nodes bfsStateMap, v int64) {
 			var (
 				c = cpb.CapabilityInfo{
 					Capability:     cap.Enum(),
 					CapabilityType: cpb.CapabilityType_CAPABILITY_TYPE_DIRECT.Enum(),
 				}
 				v0           = v
-				firstPackage = nodeToPackage(v)
-				incomingEdge *callgraph.Edge
+				firstPackage *cpb.Graph_Package
+				incomingEdge *cpb.Graph_Call
 			)
-			if firstPackage != nil {
-				c.PackageDir = proto.String(firstPackage.Path())
-				c.PackageName = proto.String(firstPackage.Name())
+			if p := graph.Functions[v].Package; p != nil {
+				firstPackage = graph.Packages[*p]
+				c.PackageDir = firstPackage.Path
+				c.PackageName = firstPackage.Name
 			}
-			for v != nil {
+			for {
 				if !config.OmitPaths || (v == v0 && config.Granularity == GranularityFunction) {
-					addFunction(&c.Path, v, incomingEdge)
+					addFunction(&c.Path, graph, v, incomingEdge)
 				}
-				if p := nodeToPackage(v); p != nil && p != firstPackage && !isStdLib(p.Path()) {
-					*c.CapabilityType = cpb.CapabilityType_CAPABILITY_TYPE_TRANSITIVE
+				if pi := graph.Functions[v].Package; pi != nil {
+					if p := graph.Packages[*pi]; p != firstPackage && !p.GetIsStandardLibrary() {
+						*c.CapabilityType = cpb.CapabilityType_CAPABILITY_TYPE_TRANSITIVE
+					}
 				}
-				incomingEdge, v = nodes[v].edge, nodes[v].next()
+				incomingEdge = nodes[v].edge
+				if incomingEdge == nil {
+					break
+				}
+				v = incomingEdge.GetCallee()
 			}
 			if !config.OmitPaths {
 				var b strings.Builder
@@ -129,23 +138,27 @@ func GetCapabilityInfo(pkgs []*packages.Package, queriedPackages map[*types.Pack
 				c.DepPath = proto.String(b.String())
 			}
 			caps = append(caps, output{&c, v0})
-		}, config)
+		})
 	sort.Slice(caps, func(i, j int) bool {
 		if x, y := caps[i].CapabilityInfo.GetCapability(), caps[j].CapabilityInfo.GetCapability(); x != y {
 			return x < y
 		}
-		return nodeCompare(caps[i].Node, caps[j].Node) < 0
+		return compareFunctions(graph, caps[i].Function, caps[j].Function) < 0
 	})
 	if config.Granularity == GranularityPackage {
 		// Keep only the first entry in the sorted list for each (capability, package) pair.
 		type cp struct {
 			cpb.Capability
-			*types.Package
+			Package int64
 		}
 		seen := make(map[cp]struct{})
 		// del returns true if the capability and package of o have been seen before.
 		del := func(o output) bool {
-			cp := cp{o.CapabilityInfo.GetCapability(), nodeToPackage(o.Node)}
+			pkg := graph.Functions[o.Function].Package
+			if pkg == nil {
+				return true
+			}
+			cp := cp{o.CapabilityInfo.GetCapability(), *pkg}
 			if _, ok := seen[cp]; ok {
 				return true
 			}
@@ -156,8 +169,8 @@ func GetCapabilityInfo(pkgs []*packages.Package, queriedPackages map[*types.Pack
 	}
 	cil := &cpb.CapabilityInfoList{
 		CapabilityInfo: make([]*cpb.CapabilityInfo, len(caps)),
-		ModuleInfo:     collectModuleInfo(pkgs),
-		PackageInfo:    collectPackageInfo(pkgs),
+		ModuleInfo:     collectModuleInfo(graph),
+		PackageInfo:    collectPackageInfo(graph),
 	}
 	for i := range caps {
 		cil.CapabilityInfo[i] = caps[i].CapabilityInfo
@@ -177,11 +190,11 @@ type CapabilityCounter struct {
 // those packages which have a path in the callgraph to an "interesting"
 // function (see the "interesting" package), we give aggregated statistics
 // about the capability usage.
-func GetCapabilityStats(pkgs []*packages.Package, queriedPackages map[*types.Package]struct{}, config *Config) *cpb.CapabilityStatList {
+func GetCapabilityStats(graph *cpb.Graph, config *Config) *cpb.CapabilityStatList {
 	var cs []*cpb.CapabilityStats
 	cm := make(map[string]*CapabilityCounter)
-	forEachPath(pkgs, queriedPackages,
-		func(cap cpb.Capability, nodes bfsStateMap, v *callgraph.Node) {
+	forEachPath(graph,
+		func(cap cpb.Capability, nodes bfsStateMap, v int64) {
 			if _, ok := cm[cap.String()]; !ok {
 				cm[cap.String()] = &CapabilityCounter{count: 1, capability: cap}
 			} else {
@@ -189,19 +202,28 @@ func GetCapabilityStats(pkgs []*packages.Package, queriedPackages map[*types.Pac
 			}
 			var (
 				v0           = v
-				firstPackage = nodeToPackage(v)
-				incomingEdge *callgraph.Edge
+				firstPackage *cpb.Graph_Package
+				incomingEdge *cpb.Graph_Call
 				isDirect     = true
 				example      []*cpb.Function
 			)
-			for v != nil {
+			if p := graph.Functions[v].Package; p != nil {
+				firstPackage = graph.Packages[*p]
+			}
+			for {
 				if !config.OmitPaths || v == v0 {
-					addFunction(&example, v, incomingEdge)
+					addFunction(&example, graph, v, incomingEdge)
 				}
-				if p := nodeToPackage(v); p != nil && p != firstPackage && !isStdLib(p.Path()) {
-					isDirect = false
+				if pi := graph.Functions[v].Package; pi != nil {
+					if p := graph.Packages[*pi]; p != firstPackage && !p.GetIsStandardLibrary() {
+						isDirect = false
+					}
 				}
-				incomingEdge, v = nodes[v].edge, nodes[v].next()
+				incomingEdge = nodes[v].edge
+				if incomingEdge == nil {
+					break
+				}
+				v = incomingEdge.GetCallee()
 			}
 			if isDirect {
 				if _, ok := cm[cap.String()]; !ok {
@@ -221,7 +243,7 @@ func GetCapabilityStats(pkgs []*packages.Package, queriedPackages map[*types.Pac
 			} else {
 				cm[cap.String()].example = example
 			}
-		}, config)
+		})
 	for _, counts := range cm {
 		cs = append(cs, &cpb.CapabilityStats{
 			Capability:      &counts.capability,
@@ -236,72 +258,64 @@ func GetCapabilityStats(pkgs []*packages.Package, queriedPackages map[*types.Pac
 	})
 	return &cpb.CapabilityStatList{
 		CapabilityStats: cs,
-		ModuleInfo:      collectModuleInfo(pkgs),
+		ModuleInfo:      collectModuleInfo(graph),
 	}
 }
 
-// GetCapabilityCount analyzes the packages in pkgs.  For each function in
+// GetCapabilityCounts analyzes the packages in pkgs.  For each function in
 // those packages which have a path in the callgraph to an "interesting"
 // function (see the "interesting" package), we give an aggregate count of the
 // capability usage.
-func GetCapabilityCounts(pkgs []*packages.Package, queriedPackages map[*types.Package]struct{}, config *Config) *cpb.CapabilityCountList {
+func GetCapabilityCounts(graph *cpb.Graph) *cpb.CapabilityCountList {
 	cm := make(map[string]int64)
-	forEachPath(pkgs, queriedPackages,
-		func(cap cpb.Capability, nodes bfsStateMap, v *callgraph.Node) {
+	forEachPath(graph,
+		func(cap cpb.Capability, nodes bfsStateMap, v int64) {
 			if _, ok := cm[cap.String()]; !ok {
 				cm[cap.String()] = 1
 			} else {
 				cm[cap.String()] += 1
 			}
-		}, config)
+		})
 	return &cpb.CapabilityCountList{
 		CapabilityCounts: cm,
-		ModuleInfo:       collectModuleInfo(pkgs),
+		ModuleInfo:       collectModuleInfo(graph),
 	}
 }
 
 // searchBackwardsFromCapabilities returns the set of all function nodes that
 // have a path in the call graph to a function in nodesByCapability.
-// It ignores edges whose caller is in allNodesWithExplicitCapability.
-func searchBackwardsFromCapabilities(nodesByCapability nodesetPerCapability, safe, allNodesWithExplicitCapability nodeset, classifier Classifier) bfsStateMap {
+func searchBackwardsFromCapabilities(g *indexedGraph, nodesByCapability nodesetPerCapability) bfsStateMap {
 	var (
 		visited = make(bfsStateMap)
-		q       []*callgraph.Node
+		q       []int64
 	)
 	// Initialize the queue to contain the nodes with a capability.
 	for _, nodes := range nodesByCapability {
 		for v := range nodes {
-			if _, ok := safe[v]; ok {
+			if _, ok := g.safe[v]; ok {
 				continue
 			}
 			q = append(q, v)
 			visited[v] = bfsState{}
 		}
 	}
-	sort.Sort(byFunction(q)) // make the search order deterministic
+	// make the search order deterministic
+	sort.Slice(q, func(x, y int) bool { return compareFunctions(g.Graph, q[x], q[y]) < 0 })
 	// Perform a BFS backwards through the call graph from the interesting
 	// nodes.
 	for len(q) > 0 {
 		v := q[0]
 		q = q[1:]
-		var incomingEdges []*callgraph.Edge
-		for _, edge := range v.In {
-			if !classifier.IncludeCall(edge) {
+		for _, edge := range g.incomingTo[v] {
+			w := edge.GetCaller()
+			if _, ok := g.safe[w]; ok {
 				continue
 			}
-			if _, ok := safe[edge.Caller]; ok {
-				continue
-			}
-			if _, ok := allNodesWithExplicitCapability[edge.Caller]; ok {
+			if _, ok := g.allNodesWithExplicitCapability[w]; ok {
 				// If edge.Caller is already categorized, we don't want to consider
 				// paths that lead from there to another capability.
 				continue
 			}
-			incomingEdges = append(incomingEdges, edge)
-		}
-		sort.Sort(byCaller(incomingEdges)) // make the search order deterministic
-		for _, edge := range incomingEdges {
-			w := edge.Caller
 			if _, ok := visited[w]; ok {
 				// We have already visited w.
 				continue
@@ -313,7 +327,7 @@ func searchBackwardsFromCapabilities(nodesByCapability nodesetPerCapability, saf
 	return visited
 }
 
-// searchForwardsFromQueriedFunctions searches from a set of function nodes to
+// searchForwardsFromRootFunctions searches from a set of function nodes to
 // find all the nodes they can reach which themselves reach a node with some
 // capability.
 //
@@ -321,34 +335,31 @@ func searchBackwardsFromCapabilities(nodesByCapability nodesetPerCapability, saf
 // outputCall is called for each edge between two such nodes.
 // outputCapability is called for each node reached in the graph that has some
 // direct capability.
-func searchForwardsFromQueriedFunctions(
-	nodes nodeset,
+func searchForwardsFromRootFunctions(
+	graph *indexedGraph,
 	nodesByCapability nodesetPerCapability,
-	allNodesWithExplicitCapability nodeset,
 	bfsFromCapabilities bfsStateMap,
-	classifier Classifier,
 	outputNode GraphOutputNodeFn,
 	outputCall GraphOutputCallFn,
 	outputCapability GraphOutputCapabilityFn,
 ) {
 	var (
-		q              []*callgraph.Node
-		bfsFromQueries = make(bfsStateMap)
+		q            []int64
+		bfsFromRoots = make(bfsStateMap)
 	)
-	for v := range nodes {
-		if _, ok := bfsFromCapabilities[v]; !ok {
-			// This node cannot reach a capability.
-			continue
+	for v := range bfsFromCapabilities {
+		if isRootPackageFunction(graph.Graph, v) {
+			q = append(q, v)
+			bfsFromRoots[v] = bfsState{}
 		}
-		q = append(q, v)
-		bfsFromQueries[v] = bfsState{}
 	}
-	sort.Sort(byFunction(q)) // make the search order deterministic
+	// make the search order deterministic
+	sort.Slice(q, func(x, y int) bool { return compareFunctions(graph.Graph, q[x], q[y]) < 0 })
 	for len(q) > 0 {
 		v := q[0]
 		q = q[1:]
 		if outputNode != nil {
-			outputNode(bfsFromQueries, v, bfsFromCapabilities)
+			outputNode(bfsFromRoots, v, bfsFromCapabilities)
 		}
 		if outputCapability != nil {
 			for c, nodes := range nodesByCapability {
@@ -357,34 +368,27 @@ func searchForwardsFromQueriedFunctions(
 				}
 			}
 		}
-		if _, ok := allNodesWithExplicitCapability[v]; ok {
+		if _, ok := graph.allNodesWithExplicitCapability[v]; ok {
 			continue
 		}
-		var outgoingEdges []*callgraph.Edge
-		for _, edge := range v.Out {
-			if !classifier.IncludeCall(edge) {
+		edges := graph.outgoingFrom[v]
+		for i, edge := range edges {
+			if _, ok := bfsFromCapabilities[edge.GetCallee()]; !ok {
 				continue
 			}
-			if _, ok := bfsFromCapabilities[edge.Callee]; !ok {
-				continue
-			}
-			outgoingEdges = append(outgoingEdges, edge)
-		}
-		sort.Sort(byCallee(outgoingEdges)) // make the search order deterministic
-		for i, edge := range outgoingEdges {
-			if i > 0 && edge.Callee == outgoingEdges[i-1].Callee {
+			if i > 0 && edge.GetCallee() == edges[i-1].GetCallee() {
 				// We just saw an edge to the same callee, so this edge is redundant.
 				continue
 			}
 			if outputCall != nil {
 				outputCall(edge)
 			}
-			w := edge.Callee
-			if _, ok := bfsFromQueries[w]; ok {
+			w := edge.GetCallee()
+			if _, ok := bfsFromRoots[w]; ok {
 				// We have already visited w.
 				continue
 			}
-			bfsFromQueries[w] = bfsState{edge}
+			bfsFromRoots[w] = bfsState{edge}
 			q = append(q, w)
 		}
 	}
@@ -392,24 +396,24 @@ func searchForwardsFromQueriedFunctions(
 
 // GraphOutputNodeFn represents a function which is called by CapabilityGraph
 // for each node.
-type GraphOutputNodeFn func(fromQuery bfsStateMap, node *callgraph.Node, toCapability bfsStateMap)
+type GraphOutputNodeFn func(fromRoots bfsStateMap, node int64, toCapability bfsStateMap)
 
 // GraphOutputCallFn represents a function which is called by CapabilityGraph
 // for each edge.
-type GraphOutputCallFn func(edge *callgraph.Edge)
+type GraphOutputCallFn func(edge *cpb.Graph_Call)
 
 // GraphOutputCapabilityFn represents a function which is called by
 // CapabilityGraph for each function capability.
-type GraphOutputCapabilityFn func(fn *callgraph.Node, c cpb.Capability)
+type GraphOutputCapabilityFn func(node int64, c cpb.Capability)
 
 // CapabilityGraph analyzes the callgraph for the packages in pkgs.
 //
 // It outputs the graph containing all paths from a function belonging
-// to one of the packages in queriedPackages to a function which has
-// some capability.
+// to one of the root packages in graph to a function which has some
+// capability.
 //
 // outputNode is called for each node in the graph.  Along with the node
-// itself, it is passed the state of the BFS search from the queried packages,
+// itself, it is passed the state of the BFS search from the root packages,
 // and the state of the BFS search from functions with a capability, so that
 // the user can reconstruct an example call path including the node.
 //
@@ -423,96 +427,215 @@ type GraphOutputCapabilityFn func(fn *callgraph.Node, c cpb.Capability)
 // capability and calls the relevant output functions, before proceeding to
 // the next capability.  If filter is nil, a single graph is generated
 // including paths for all capabilities.
-func CapabilityGraph(pkgs []*packages.Package,
-	queriedPackages map[*types.Package]struct{},
-	config *Config,
+func CapabilityGraph(graph *cpb.Graph,
 	outputNode GraphOutputNodeFn,
 	outputCall GraphOutputCallFn,
 	outputCapability GraphOutputCapabilityFn,
 	filter func(capability cpb.Capability) bool,
 ) {
-	safe, nodesByCapability, extraNodesByCapability := getPackageNodesWithCapability(pkgs, config)
-	nodesByCapability, allNodesWithExplicitCapability := mergeCapabilities(nodesByCapability, extraNodesByCapability)
-	extraNodesByCapability = nil
+	g := indexGraph(graph)
 
 	search := func(nodesByCapability nodesetPerCapability) {
-		bfsFromCapabilities := searchBackwardsFromCapabilities(nodesByCapability, safe, allNodesWithExplicitCapability, config.Classifier)
+		bfsFromCapabilities := searchBackwardsFromCapabilities(g, nodesByCapability)
 
-		canBeReachedFromQuery := make(nodeset)
-		for v := range bfsFromCapabilities {
-			if v.Func.Package() == nil {
-				continue
-			}
-			if _, ok := queriedPackages[v.Func.Package().Pkg]; ok {
-				canBeReachedFromQuery[v] = struct{}{}
-			}
-		}
-
-		searchForwardsFromQueriedFunctions(
-			canBeReachedFromQuery,
+		searchForwardsFromRootFunctions(
+			g,
 			nodesByCapability,
-			allNodesWithExplicitCapability,
 			bfsFromCapabilities,
-			config.Classifier,
 			outputNode,
 			outputCall,
 			outputCapability)
 	}
 	if filter != nil {
 		// Consider each capability individually.
-		for c, ns := range nodesByCapability {
+		for c, ns := range g.nodesByCapability {
 			if filter(c) {
 				search(nodesetPerCapability{c: ns})
 			}
 		}
 	} else {
 		// Generate a single graph.
-		search(nodesByCapability)
+		search(g.nodesByCapability)
 	}
 }
 
-// getPackageNodesWithCapability analyzes all the functions in pkgs and their
-// transitive dependencies, and returns three sets of callgraph nodes.
+// ExportGraph processes the specified packages and outputs a callgraph and a
+// set of function capability annotations.
 //
-// safe contains the set of nodes for functions that have been explicitly
-// classified as safe.
-// nodesByCapability contains nodes that have been explicitly categorized
-// as having some particular capability.  These are in a map from capability
-// to a set of nodes.
-// extraNodesByCapability contains nodes for functions that use unsafe pointers
-// or the reflect package in a way that we want to report to the user.
-func getPackageNodesWithCapability(pkgs []*packages.Package,
-	config *Config,
-) (safe nodeset, nodesByCapability, extraNodesByCapability nodesetPerCapability) {
+// The packages in pkgs are "root" packages in the output.  All of their
+// transitive dependencies are also included in the output graph.
+func ExportGraph(pkgs []*packages.Package, config *Config) *cpb.Graph {
 	graph, ssaProg, allFunctions := buildGraph(pkgs, true)
 	unsafePointerFunctions := findUnsafePointerConversions(pkgs, ssaProg, allFunctions)
-	ssaProg = nil // possibly save memory; we don't use ssaProg again
-	safe = make(nodeset)
-	nodesByCapability = make(nodesetPerCapability)
-	for f, node := range graph.Nodes {
-		c := getExplicitCapability(f, config.Classifier)
-		if c == cpb.Capability_CAPABILITY_SAFE {
-			safe[node] = struct{}{}
-		} else if c != cpb.Capability_CAPABILITY_UNSPECIFIED {
-			nodesByCapability.add(c, node)
+	g := &cpb.Graph{Language: proto.String("Go")}
+
+	// Build g.Modules
+	modulePathIndex := make(map[string]*int64)
+	{
+		pathToModule := make(map[string]*packages.Module)
+		forEachPackageIncludingDependencies(pkgs, func(pkg *packages.Package) {
+			m := pkg.Module
+			if m == nil || m.Path == "" || m.Version == "" {
+				// No module information.
+				return
+			}
+			if _, ok := pathToModule[m.Path]; ok {
+				// We have seen this path.
+				return
+			}
+			pathToModule[m.Path] = m
+		})
+		modules := slices.Collect(maps.Values(pathToModule))
+		slices.SortFunc(modules, func(a, b *packages.Module) int {
+			return strings.Compare(a.Path, b.Path)
+		})
+		g.Modules = make([]*cpb.Graph_Module, len(modules))
+		for i, m := range modules {
+			g.Modules[i] = &cpb.Graph_Module{
+				Name:    proto.String(m.Path),
+				Version: proto.String(m.Version),
+			}
+			modulePathIndex[m.Path] = proto.Int64(int64(i))
 		}
 	}
 
-	if !config.DisableBuiltin {
-		extraNodesByCapability = make(nodesetPerCapability)
-		for f, node := range graph.Nodes {
-			if usesReflect(f) {
-				extraNodesByCapability.add(cpb.Capability_CAPABILITY_REFLECT, node)
+	// Build g.Packages
+	pkgIndex := make(map[*types.Package]*int64)
+	{
+		rootPackagesSet := make(map[*packages.Package]struct{})
+		for _, p := range pkgs {
+			rootPackagesSet[p] = struct{}{}
+		}
+		std := standardLibraryPackages()
+		type elem struct {
+			g *cpb.Graph_Package
+			t *types.Package
+		}
+		var ps []elem
+		forEachPackageIncludingDependencies(pkgs, func(pkg *packages.Package) {
+			p := &cpb.Graph_Package{
+				Name: proto.String(pkg.Name),
+				Path: proto.String(pkg.PkgPath),
 			}
-			if noSource(f) {
-				extraNodesByCapability.add(cpb.Capability_CAPABILITY_ARBITRARY_EXECUTION, node)
+			if _, ok := rootPackagesSet[pkg]; ok {
+				p.IsRoot = proto.Bool(true)
 			}
-			if _, ok := unsafePointerFunctions[f]; ok {
-				extraNodesByCapability.add(cpb.Capability_CAPABILITY_UNSAFE_POINTER, node)
+			if _, ok := std[pkg.PkgPath]; ok {
+				p.IsStandardLibrary = proto.Bool(true)
+			}
+			if m := pkg.Module; m != nil {
+				p.Module = modulePathIndex[m.Path]
+			}
+			ps = append(ps, elem{g: p, t: pkg.Types})
+		})
+		slices.SortFunc(ps, func(a, b elem) int {
+			return strings.Compare(a.g.GetPath(), b.g.GetPath())
+		})
+		g.Packages = make([]*cpb.Graph_Package, len(ps))
+		for i, elem := range ps {
+			g.Packages[i] = elem.g
+			pkgIndex[elem.t] = proto.Int64(int64(i))
+		}
+	}
+
+	// Build g.Functions
+	functionIndex := make(map[*callgraph.Node]*int64)
+	{
+		type elem struct {
+			g *cpb.Graph_Function
+			n *callgraph.Node
+		}
+		var fs []elem
+		for fn, node := range graph.Nodes {
+			gfn := &cpb.Graph_Function{
+				Name:     proto.String(fn.String()),
+				Function: proto.String(fn.Name()),
+			}
+			if pkg := nodeToPackage(node); pkg != nil {
+				gfn.Package = pkgIndex[pkg]
+			}
+			if sig := fn.Signature; sig != nil {
+				if recv := sig.Recv(); recv != nil {
+					if t := recv.Type(); t != nil {
+						gfn.Type = proto.String(t.String())
+					}
+				}
+			}
+			for _, t := range fn.TypeArgs() {
+				gfn.TypeArguments = append(gfn.TypeArguments, t.String())
+			}
+			fs = append(fs, elem{gfn, node})
+		}
+		slices.SortFunc(fs, func(a, b elem) int {
+			return compareFunctionObjects(g, a.g, b.g)
+		})
+		g.Functions = make([]*cpb.Graph_Function, len(fs))
+		for i, elem := range fs {
+			g.Functions[i] = elem.g
+			functionIndex[elem.n] = proto.Int64(int64(i))
+		}
+	}
+
+	// Build g.Capabilities
+	{
+		pTrue := proto.Bool(true)
+		for fn, node := range graph.Nodes {
+			add := func(c cpb.Capability, implicit bool) {
+				fc := &cpb.Graph_FunctionCapability{
+					Function:   functionIndex[node],
+					Capability: c.Enum(),
+				}
+				if implicit {
+					fc.Implicit = pTrue
+				}
+				g.Capabilities = append(g.Capabilities, fc)
+			}
+			if c := getExplicitCapability(fn, config.Classifier); c != cpb.Capability_CAPABILITY_UNSPECIFIED {
+				add(c, false)
+			} else if !config.DisableBuiltin {
+				if usesReflect(fn) {
+					add(cpb.Capability_CAPABILITY_REFLECT, true)
+				}
+				if noSource(fn) {
+					add(cpb.Capability_CAPABILITY_ARBITRARY_EXECUTION, true)
+				}
+				if _, ok := unsafePointerFunctions[fn]; ok {
+					add(cpb.Capability_CAPABILITY_UNSAFE_POINTER, true)
+				}
 			}
 		}
 	}
-	return safe, nodesByCapability, extraNodesByCapability
+
+	// Build g.Calls
+	for _, node := range graph.Nodes {
+		idx1, ok := functionIndex[node]
+		if !ok {
+			continue
+		}
+		for _, e := range node.Out {
+			if !config.Classifier.IncludeCall(e) {
+				continue
+			}
+			idx2, ok := functionIndex[e.Callee]
+			if !ok {
+				continue
+			}
+			edge := cpb.Graph_Call{
+				Caller: idx1,
+				Callee: idx2,
+			}
+			if position := callsitePosition(e); position.IsValid() {
+				edge.CallSite = &cpb.Graph_Site{
+					Directory: proto.String(path.Dir(position.Filename)),
+					Filename:  proto.String(path.Base(position.Filename)),
+					Line:      proto.Int64(int64(position.Line)),
+					Column:    proto.Int64(int64(position.Column)),
+				}
+			}
+			g.Calls = append(g.Calls, &edge)
+		}
+	}
+	return g
 }
 
 // usesReflect determines if fn copies reflect.Value objects in a way that could
@@ -647,81 +770,41 @@ func getExplicitCapability(fn *ssa.Function, classifier Classifier) cpb.Capabili
 	return classifier.FunctionCategory(pkg, name)
 }
 
-func mergeCapabilities(nodesByCapability, extraNodesByCapability nodesetPerCapability) (nodesetPerCapability, nodeset) {
-	// We gather here all the nodes which were given an explicit categorization.
-	// We will not search for paths that go through these nodes to reach other
-	// capabilities; for example, we do not report that os.ReadFile also has
-	// a descendant that will make system calls.
-	allNodesWithExplicitCapability := make(nodeset)
-	for _, nodes := range nodesByCapability {
-		for v := range nodes {
-			allNodesWithExplicitCapability[v] = struct{}{}
-		}
-	}
-	// Now that we have constructed allNodesWithExplicitCapability, we add the
-	// nodes from extraNodesByCapability to nodesByCapability, so that we find
-	// paths to all these nodes together when we do a BFS.
-	// extraNodesByCapability contains function capabilities that our analyzer
-	// found by examining the function's source code.  These findings are
-	// ignored when they apply to a function that already has an explicit
-	// category.
-	for cap, ns := range extraNodesByCapability {
-		for node := range ns {
-			if _, ok := allNodesWithExplicitCapability[node]; ok {
-				// This function already has an explicit category; don't add this
-				// extra capability.
-				continue
-			}
-			nodesByCapability.add(cap, node)
-		}
-	}
-	return nodesByCapability, allNodesWithExplicitCapability
-}
-
-// forEachPath analyzes the callgraph rooted at the packages in pkgs.
+// forEachPath analyzes the callgraph.
 //
-// For each capability, a BFS is run to find all functions in queriedPackages
+// For each capability, a BFS is run to find all functions in root packages
 // which have a path in the callgraph to a function with that capability.
 //
 // fn is called for each of these (capability, function) pairs.  fn is passed
 // the capability, a map describing the current state of the BFS, and the node
 // in the callgraph representing the function.  fn can use this information
 // to reconstruct the path.
-//
-// forEachPath may modify pkgs.
-func forEachPath(pkgs []*packages.Package, queriedPackages map[*types.Package]struct{},
-	fn func(cpb.Capability, bfsStateMap, *callgraph.Node), config *Config,
-) {
-	safe, nodesByCapability, extraNodesByCapability := getPackageNodesWithCapability(pkgs, config)
-	nodesByCapability, allNodesWithExplicitCapability := mergeCapabilities(nodesByCapability, extraNodesByCapability)
-	extraNodesByCapability = nil // we don't use extraNodesByCapability again.
+func forEachPath(graph *cpb.Graph, fn func(cpb.Capability, bfsStateMap, int64)) {
+	g := indexGraph(graph)
+
 	var caps []cpb.Capability
-	for cap := range nodesByCapability {
+	for cap := range g.nodesByCapability {
 		caps = append(caps, cap)
 	}
-	sort.Slice(caps, func(i, j int) bool { return caps[i] < caps[j] })
+	slices.Sort(caps)
 	for _, cap := range caps {
-		nodes := nodesByCapability[cap]
+		nodes := g.nodesByCapability[cap]
 		var (
 			visited = make(bfsStateMap)
-			q       []*callgraph.Node // queue for the BFS
+			q       []int64 // queue for the BFS
 		)
 		// Initialize the queue to contain the nodes with the capability.
 		for v := range nodes {
-			if _, ok := safe[v]; ok {
+			if _, ok := g.safe[v]; ok {
 				continue
 			}
 			q = append(q, v)
 			visited[v] = bfsState{}
 		}
-		sort.Sort(byFunction(q))
+		sort.Slice(q, func(x, y int) bool { return compareFunctions(graph, q[x], q[y]) < 0 })
 		for _, v := range q {
-			// Skipping cases where v.Func.Package() doesn't exist.
-			if v.Func.Package() == nil {
-				continue
-			}
-			if _, ok := queriedPackages[v.Func.Package().Pkg]; ok {
-				// v itself is in one of the queried packages.  Call fn here because
+			if isRootPackageFunction(graph, v) {
+				// v itself is in a root package.  Call fn here because
 				// the BFS below will only call fn for functions that call v
 				// directly or transitively.
 				fn(cap, visited, v)
@@ -732,49 +815,128 @@ func forEachPath(pkgs []*packages.Package, queriedPackages map[*types.Package]st
 		for len(q) > 0 {
 			v := q[0]
 			q = q[1:]
-			var incomingEdges []*callgraph.Edge
-			for _, edge := range v.In {
-				if config.Classifier.IncludeCall(edge) {
-					incomingEdges = append(incomingEdges, edge)
-				}
-			}
-			sort.Sort(byCaller(incomingEdges))
-			for _, edge := range incomingEdges {
-				w := edge.Caller
-				if w.Func == nil {
-					// Synthetic nodes may not have this information.
-					continue
-				}
-				if _, ok := safe[w]; ok {
+			for _, edge := range g.incomingTo[v] {
+				w := edge.GetCaller()
+				if _, ok := g.safe[w]; ok {
 					continue
 				}
 				if _, ok := visited[w]; ok {
 					// We have already visited w.
 					continue
 				}
-				if _, ok := allNodesWithExplicitCapability[w]; ok {
+				if _, ok := g.allNodesWithExplicitCapability[w]; ok {
 					// w already has an explicit categorization.
 					continue
 				}
 				visited[w] = bfsState{edge: edge}
 				q = append(q, w)
-				if pkg := nodeToPackage(w); pkg != nil {
-					if _, ok := queriedPackages[pkg]; ok {
-						fn(cap, visited, w)
-					}
+				if isRootPackageFunction(graph, w) {
+					fn(cap, visited, w)
 				}
 			}
 		}
 	}
 }
 
+// indexedGraph contains an input Graph, along with structures indexing the
+// data within it.
+type indexedGraph struct {
+	*cpb.Graph
+
+	// safe is those nodes marked with the SAFE capability.  A safe function
+	// does not inherit the capabilities of its callees.
+	safe nodeset
+
+	// allNodesWithExplicitCapability is those nodes marked with an "explicit"
+	// capability.  These do not inherit the capability of any of their callees.
+	// For example, a function to open a file may be marked with the FILES
+	// capability, and also call a function with the SYSTEM_CALLS capability.
+	// Since the function is marked with an explicit capability FILES, it does
+	// not inherit SYSTEM_CALLS from its callee.
+	//
+	// For functions marked with an "implicit" capability, for example where
+	// source code analysis finds that it uses unsafe pointers, the capabilities
+	// of its callees are still considered, just as they would for a function
+	// with no capabilities of its own.
+	allNodesWithExplicitCapability nodeset
+
+	nodesByCapability nodesetPerCapability
+
+	// outgoingFrom and incomingTo contain the graph edges indexed into adjacency
+	// lists.  The edge lists are sorted, so that algorithms using them can more
+	// easily be made deterministic.
+	outgoingFrom adjList
+	incomingTo   adjList
+}
+
+type adjList [][]*cpb.Graph_Call
+
+func (a adjList) add(v int64, edge *cpb.Graph_Call) {
+	a[v] = append(a[v], edge)
+}
+
+func indexGraph(g *cpb.Graph) *indexedGraph {
+	ig := &indexedGraph{
+		Graph:                          g,
+		safe:                           make(nodeset),
+		allNodesWithExplicitCapability: make(nodeset),
+		nodesByCapability:              make(nodesetPerCapability),
+		outgoingFrom:                   make(adjList, len(g.Functions)),
+		incomingTo:                     make(adjList, len(g.Functions)),
+	}
+	validFn := func(fn *int64) bool {
+		return fn != nil && *fn < int64(len(g.Functions))
+	}
+	for _, c := range g.Capabilities {
+		if c.Capability == nil || !validFn(c.Function) {
+			continue
+		}
+		cap := c.GetCapability()
+		fn := c.GetFunction()
+		if cap == cpb.Capability_CAPABILITY_SAFE {
+			ig.safe[fn] = struct{}{}
+			continue
+		}
+		if !c.GetImplicit() {
+			ig.allNodesWithExplicitCapability[fn] = struct{}{}
+		}
+		ig.nodesByCapability.add(cap, fn)
+	}
+	for _, edge := range g.Calls {
+		if !validFn(edge.Callee) || !validFn(edge.Caller) {
+			continue
+		}
+		ig.incomingTo.add(edge.GetCallee(), edge)
+		ig.outgoingFrom.add(edge.GetCaller(), edge)
+	}
+	for _, es := range ig.incomingTo {
+		slices.SortFunc(es, func(a, b *cpb.Graph_Call) int {
+			return compareEdges(g, a, b)
+		})
+	}
+	for _, es := range ig.outgoingFrom {
+		slices.SortFunc(es, func(a, b *cpb.Graph_Call) int {
+			return compareEdges(g, a, b)
+		})
+	}
+	return ig
+}
+
+func isRootPackageFunction(g *cpb.Graph, v int64) bool {
+	p := g.Functions[v].Package
+	if p == nil {
+		return false
+	}
+	return g.Packages[*p].GetIsRoot()
+}
+
 // intermediatePackages returns a CapabilityInfo for each unique (P, C) pair
-// where there is a call path from a function in one of the queried packages
+// where there is a call path from a function in one of the root packages
 // to a function with capability C, and the call path includes a function in
 // package P.
-func intermediatePackages(pkgs []*packages.Package, queriedPackages map[*types.Package]struct{}, config *Config) *cpb.CapabilityInfoList {
+func intermediatePackages(graph *cpb.Graph, config *Config) *cpb.CapabilityInfoList {
 	type packageAndCapability struct {
-		pkg *types.Package
+		pkg int64
 		cpb.Capability
 	}
 	seen := make(map[packageAndCapability]*cpb.CapabilityInfo)
@@ -789,55 +951,55 @@ func intermediatePackages(pkgs []*packages.Package, queriedPackages map[*types.P
 		return config.CapabilitySet.Has(c)
 	}
 
-	nodeCallback := func(queryBFS bfsStateMap, node *callgraph.Node, capabilityBFS bfsStateMap) {
-		// We have found node in a BFS of the callgraph starting from functions in
-		// pkgs, and in a BFS of the callgraph searching backwards from functions
+	nodeCallback := func(rootBFS bfsStateMap, node int64, capabilityBFS bfsStateMap) {
+		// We have found node in a BFS of the callgraph starting from root packages,
+		// and in a BFS of the callgraph searching backwards from functions
 		// with capabilities.  So we can construct a path from one to the other
 		// through node.
-		pkg := nodeToPackage(node)
+		pkg := graph.Functions[node].Package
 		if pkg == nil {
 			// This node represents some kind of wrapper function that we don't need
 			// to consider.
 			return
 		}
-		pc := packageAndCapability{pkg, capability}
+		pc := packageAndCapability{*pkg, capability}
 		if _, ok := seen[pc]; ok {
 			// We have already seen this (package, capability) pair.
 			return
 		}
 		ci := cpb.CapabilityInfo{
 			Capability:  capability.Enum(),
-			PackageDir:  proto.String(pkg.Path()),
-			PackageName: proto.String(pkg.Name()),
+			PackageDir:  graph.Packages[*pkg].Path,
+			PackageName: graph.Packages[*pkg].Name,
 		}
 		if !config.OmitPaths {
 			// Add ci.Path entries for the part of the path leading from a function in
 			// pkgs to node, including node itself.
-			for v := node; v != nil; {
-				e := queryBFS[v].edge
-				addFunction(&ci.Path, v, e)
+			for v := node; true; {
+				e := rootBFS[v].edge
+				addFunction(&ci.Path, graph, v, e)
 				if e == nil {
 					break
 				}
-				v = e.Caller
+				v = e.GetCaller()
 			}
 			// Reverse the path we have so far, since we visited its nodes in reverse
 			// order.
 			slices.Reverse(ci.Path)
 			// Add ci.Path entries for the part of the path leading from node to a
 			// function with a capability.
-			for v := node; v != nil; {
+			for v := node; true; {
 				e := capabilityBFS[v].edge
 				if e == nil {
 					break
 				}
-				v = e.Callee
-				addFunction(&ci.Path, v, e)
+				v = e.GetCallee()
+				addFunction(&ci.Path, graph, v, e)
 			}
 		}
 		seen[pc] = &ci
 	}
-	CapabilityGraph(pkgs, queriedPackages, config, nodeCallback, nil, nil, filter)
+	CapabilityGraph(graph, nodeCallback, nil, nil, filter)
 	cis := make([]*cpb.CapabilityInfo, 0, len(seen))
 	for _, ci := range seen {
 		cis = append(cis, ci)

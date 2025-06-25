@@ -9,6 +9,7 @@ package analyzepackages_test
 import (
 	"bytes"
 	"fmt"
+	"io"
 	"log"
 	"os"
 	"os/exec"
@@ -36,6 +37,10 @@ func TestMain(m *testing.M) {
 	cmd := exec.Command("go", "build", "-o", bin, "../cmd/capslock")
 	if err = cmd.Run(); err != nil {
 		log.Fatal("Building executable: ", err)
+	}
+	// Compute some Capslock output before starting the tests.
+	if err = getCapslockResults(); err != nil {
+		log.Fatal("Running capslock: ", err)
 	}
 	// Run tests.
 	m.Run()
@@ -77,36 +82,84 @@ func (path expectedPath) matches(cil *cpb.CapabilityInfoList) (bool, error) {
 	return false, nil
 }
 
-var analyzeResult struct {
-	sync.Once
-	output []byte
-	error
-}
+// analysisResult is the result of `capslock -output=json`.
+var analysisResult []byte
 
-// analyze returns the results of analyzing the test packages with
-// capslock -output=json.  It caches its results in analyzeResult.
-func analyze() ([]byte, error) {
-	analyzeResult.Do(func() {
+// exportAnalysisResult is the result of piping `capslock -export` to
+// `capslock -import -output=json`.
+var exportAnalysisResult []byte
+
+func getCapslockResults() error {
+	{
 		cmd := exec.Command(bin, "-packages=../testpkgs/...", "-output=json")
 		var output bytes.Buffer
 		cmd.Stdout = &output
 		cmd.Stderr = os.Stderr
 		if err := cmd.Run(); err != nil {
-			analyzeResult.error = fmt.Errorf("running capslock: %w", err)
-			return
+			return err
 		}
-		analyzeResult.output = output.Bytes()
-	})
-	return analyzeResult.output, analyzeResult.error
+		analysisResult = output.Bytes()
+	}
+	{
+		cmd1 := exec.Command(bin, "-packages=../testpkgs/...", "-export")
+		stdout, err := cmd1.StdoutPipe()
+		if err != nil {
+			return err
+		}
+		cmd1.Stderr = os.Stderr
+
+		var output bytes.Buffer
+		cmd2 := exec.Command(bin, "-import=-", "-output=json")
+		cmd2.Stdout = &output
+		stdin, err := cmd2.StdinPipe()
+		if err != nil {
+			return err
+		}
+		cmd2.Stderr = os.Stderr
+		if err := cmd1.Start(); err != nil {
+			return err
+		}
+		if err := cmd2.Start(); err != nil {
+			return err
+		}
+		var (
+			copyErr error
+			wg      sync.WaitGroup
+		)
+		wg.Add(1)
+
+		go func() {
+			if _, err := io.Copy(stdin, stdout); err != nil {
+				copyErr = err
+			}
+			stdin.Close()
+			wg.Done()
+		}()
+
+		// Wait for all commands to finish.
+		if err := cmd1.Wait(); err != nil {
+			return err
+		}
+		if err := cmd2.Wait(); err != nil {
+			return err
+		}
+		wg.Wait()
+		if copyErr != nil {
+			return copyErr
+		}
+		exportAnalysisResult = output.Bytes()
+	}
+	return nil
 }
 
 func TestExpectedOutput(t *testing.T) {
-	analyzeOutput, err := analyze()
-	if err != nil {
-		t.Fatal(err)
-	}
+	t.Run("default", func(t *testing.T) { testExpectedOutput(t, analysisResult) })
+	t.Run("using export and import", func(t *testing.T) { testExpectedOutput(t, exportAnalysisResult) })
+}
+
+func testExpectedOutput(t *testing.T, output []byte) {
 	cil := new(cpb.CapabilityInfoList)
-	if err = protojson.Unmarshal(analyzeOutput, cil); err != nil {
+	if err := protojson.Unmarshal(output, cil); err != nil {
 		t.Fatalf("Couldn't parse analyzer output: %v", err)
 	}
 
@@ -269,7 +322,7 @@ func TestExpectedOutput(t *testing.T) {
 		}
 	}
 	if t.Failed() {
-		t.Log(string(analyzeOutput))
+		t.Log(string(output))
 	}
 }
 
@@ -292,6 +345,7 @@ func TestGraph(t *testing.T) {
 				`"github.com/google/capslock/testpkgs/useunsafe.init" -> "CAPABILITY_UNSAFE_POINTER"`:                                                          0,
 				`"github.com/google/capslock/testpkgs/useunsafe.NestedFunctions$1$1$1" -> "CAPABILITY_UNSAFE_POINTER"`:                                         0,
 				`"github.com/google/capslock/testpkgs/useunsafe.ReturnFunction$1" -> "CAPABILITY_UNSAFE_POINTER"`:                                              0,
+				`"(*github.com/google/capslock/testpkgs/useunsafe.T).M" -> "(github.com/google/capslock/testpkgs/useunsafe.T).M"`:                              0,
 				`"(github.com/google/capslock/testpkgs/useunsafe.T).M" -> "CAPABILITY_UNSAFE_POINTER"`:                                                         0,
 				`}`: 0,
 			},
@@ -380,11 +434,7 @@ func TestCompare(t *testing.T) {
 	}
 
 	// Make a temporary file with the expected output.
-	b, err := analyze()
-	if err != nil {
-		t.Fatal(err)
-	}
-	f1, err, done := mktemp(b)
+	f1, err, done := mktemp(analysisResult)
 	if err != nil {
 		t.Fatalf("Creating first temporary file: %v", err)
 	}
@@ -392,7 +442,7 @@ func TestCompare(t *testing.T) {
 
 	// Make a second temporary file with some of the output changed, to produce
 	// a difference to be found.
-	b = bytes.ReplaceAll(b, []byte("callruntime"), []byte("callruntime2"))
+	b := bytes.ReplaceAll(analysisResult, []byte("callruntime"), []byte("callruntime2"))
 	f2, err, done := mktemp(b)
 	if err != nil {
 		t.Fatalf("Creating second temporary file: %v", err)

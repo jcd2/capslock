@@ -1,0 +1,67 @@
+// Copyright 2025 Google LLC
+//
+// Use of this source code is governed by a BSD-style
+// license that can be found in the LICENSE file or at
+// https://developers.google.com/open-source/licenses/bsd
+
+syntax = "proto2";
+
+package capslock.proto;
+
+import "capability.proto";
+
+option go_package = "github.com/google/capslock/proto";
+
+message Graph {
+  optional string language = 1;
+
+  message Function {
+    optional string name = 1;
+    optional int64 package = 2;
+    optional string type = 3;
+    optional string function = 4;
+    repeated string type_arguments = 5;
+    repeated string parameter_types = 6;
+    repeated string properties = 7;
+    optional string language = 8;
+  }
+  repeated Function functions = 2;
+
+  message Call {
+    optional int64 caller = 1;
+    optional int64 callee = 2;
+    optional Site call_site = 3;
+  }
+  repeated Call calls = 3;
+
+  message FunctionCapability {
+    optional int64 function = 1;
+    optional Capability capability = 2;
+    optional Site site = 3;
+    optional bool implicit = 4;
+  }
+  repeated FunctionCapability capabilities = 4;
+
+  message Package {
+    optional string name = 1;
+    optional string path = 2;
+    optional int64 module = 3;
+    optional bool is_root = 4;
+    optional bool is_standard_library = 5;
+  }
+  repeated Package packages = 5;
+
+  message Module {
+    optional string name = 1;
+    optional string version = 2;
+    optional string hash = 3;
+  }
+  repeated Module modules = 6;
+
+  message Site {
+    optional string directory = 1;
+    optional string filename = 2;
+    optional int64 line = 3;
+    optional int64 column = 4;
+  }
+}

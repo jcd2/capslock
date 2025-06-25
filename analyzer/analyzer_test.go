@@ -8,7 +8,6 @@ package analyzer
 
 import (
 	"fmt"
-	"go/types"
 	"os"
 	"reflect"
 	"strings"
@@ -36,10 +35,13 @@ func C() { println(os.IsExist(nil)) }
 `}
 
 // setup contains common code for loading test packages.
-func setup(filemap map[string]string, pkg ...string) (pkgs []*packages.Package, queriedPackages map[*types.Package]struct{}, cleanup func(), err error) {
+func setup(filemap map[string]string, config *Config, pkg ...string) (graph *cpb.Graph, err error) {
 	dir, cleanup, err := analysistest.WriteFiles(filemap)
+	if cleanup != nil {
+		defer cleanup()
+	}
 	if err != nil {
-		return nil, nil, cleanup, fmt.Errorf("analysistest.WriteFiles: %w", err)
+		return nil, fmt.Errorf("analysistest.WriteFiles: %w", err)
 	}
 	env := []string{"GOPATH=" + dir, "GO111MODULE=off", "GOPROXY=off"}
 	cfg := &packages.Config{
@@ -47,12 +49,12 @@ func setup(filemap map[string]string, pkg ...string) (pkgs []*packages.Package, 
 		Dir:  dir,
 		Env:  append(os.Environ(), env...),
 	}
-	pkgs, err = packages.Load(cfg, pkg...)
+	pkgs, err := packages.Load(cfg, pkg...)
 	if err != nil {
-		return nil, nil, cleanup, fmt.Errorf("packages.Load: %w", err)
+		return nil, fmt.Errorf("packages.Load: %w", err)
 	}
-	queriedPackages = GetQueriedPackages(pkgs)
-	return pkgs, queriedPackages, cleanup, nil
+	graph = ExportGraph(pkgs, config)
+	return graph, nil
 }
 
 func TestAnalysis(t *testing.T) {
@@ -61,18 +63,16 @@ func TestAnalysis(t *testing.T) {
 }
 
 func testAnalysis(t *testing.T, omitPaths bool) {
-	pkgs, queriedPackages, cleanup, err := setup(filemap, "testlib")
-	if cleanup != nil {
-		defer cleanup()
-	}
-	if err != nil {
-		t.Fatalf("setup: %v", err)
-	}
-	cil := GetCapabilityInfo(pkgs, queriedPackages, &Config{
+	config := &Config{
 		Classifier:     interesting.DefaultClassifier(),
 		DisableBuiltin: false,
 		OmitPaths:      omitPaths,
-	})
+	}
+	graph, err := setup(filemap, config, "testlib")
+	if err != nil {
+		t.Fatalf("setup: %v", err)
+	}
+	cil := GetCapabilityInfo(graph, config)
 	expected := &cpb.CapabilityInfoList{
 		CapabilityInfo: []*cpb.CapabilityInfo{{
 			PackageName: proto.String("testlib"),
@@ -117,29 +117,30 @@ func testAnalysis(t *testing.T, omitPaths bool) {
 }
 
 func TestGraph(t *testing.T) {
-	pkgs, queriedPackages, cleanup, err := setup(filemap, "testlib")
-	if cleanup != nil {
-		defer cleanup()
+	config := &Config{
+		Classifier:     interesting.DefaultClassifier(),
+		DisableBuiltin: false,
 	}
+	graph, err := setup(filemap, config, "testlib")
 	if err != nil {
 		t.Fatalf("setup: %v", err)
 	}
 	nodes := make(map[string]struct{})
 	calls := make(map[[2]string]struct{})
 	caps := make(map[string][]cpb.Capability)
-	CapabilityGraph(pkgs, queriedPackages,
-		&Config{
-			Classifier:     interesting.DefaultClassifier(),
-			DisableBuiltin: false,
+	functionName := func(node int64) string {
+		return graph.Functions[node].GetName()
+	}
+	CapabilityGraph(
+		graph,
+		func(_ bfsStateMap, node int64, _ bfsStateMap) {
+			nodes[functionName(node)] = struct{}{}
 		},
-		func(_ bfsStateMap, node *callgraph.Node, _ bfsStateMap) {
-			nodes[node.Func.String()] = struct{}{}
+		func(edge *cpb.Graph_Call) {
+			calls[[2]string{functionName(edge.GetCaller()), functionName(edge.GetCallee())}] = struct{}{}
 		},
-		func(edge *callgraph.Edge) {
-			calls[[2]string{edge.Caller.Func.String(), edge.Callee.Func.String()}] = struct{}{}
-		},
-		func(fn *callgraph.Node, c cpb.Capability) {
-			f := fn.Func.String()
+		func(node int64, c cpb.Capability) {
+			f := functionName(node)
 			caps[f] = append(caps[f], c)
 		},
 		nil)
@@ -203,17 +204,15 @@ var testClassifier1 = testClassifier{
 }
 
 func TestAnalysisWithClassifier(t *testing.T) {
-	pkgs, queriedPackages, cleanup, err := setup(filemap, "testlib")
-	if cleanup != nil {
-		defer cleanup()
+	config := &Config{
+		Classifier:     &testClassifier1,
+		DisableBuiltin: true,
 	}
+	graph, err := setup(filemap, config, "testlib")
 	if err != nil {
 		t.Fatalf("setup: %v", err)
 	}
-	cil := GetCapabilityInfo(pkgs, queriedPackages, &Config{
-		Classifier:     &testClassifier1,
-		DisableBuiltin: true,
-	})
+	cil := GetCapabilityInfo(graph, config)
 	expected := &cpb.CapabilityInfoList{
 		CapabilityInfo: []*cpb.CapabilityInfo{{
 			PackageName: proto.String("testlib"),
@@ -266,30 +265,31 @@ func TestAnalysisWithClassifier(t *testing.T) {
 }
 
 func TestGraphWithClassifier(t *testing.T) {
-	pkgs, queriedPackages, cleanup, err := setup(filemap, "testlib")
-	if cleanup != nil {
-		defer cleanup()
+	config := &Config{
+		Classifier:     &testClassifier1,
+		DisableBuiltin: true,
 	}
+	graph, err := setup(filemap, config, "testlib")
 	if err != nil {
 		t.Fatalf("setup: %v", err)
 	}
 	nodes := make(map[string]struct{})
 	calls := make(map[[2]string]struct{})
 	caps := make(map[string][]cpb.Capability)
-	CapabilityGraph(pkgs, queriedPackages,
-		&Config{
-			Classifier:     &testClassifier1,
-			DisableBuiltin: true,
+	functionName := func(node int64) string {
+		return graph.Functions[node].GetName()
+	}
+	CapabilityGraph(
+		graph,
+		func(_ bfsStateMap, node int64, _ bfsStateMap) {
+			nodes[functionName(node)] = struct{}{}
 		},
-		func(_ bfsStateMap, node *callgraph.Node, _ bfsStateMap) {
-			nodes[node.Func.String()] = struct{}{}
+		func(edge *cpb.Graph_Call) {
+			calls[[2]string{functionName(edge.GetCaller()), functionName(edge.GetCallee())}] = struct{}{}
 		},
-		func(edge *callgraph.Edge) {
-			calls[[2]string{edge.Caller.Func.String(), edge.Callee.Func.String()}] = struct{}{}
-		},
-		func(fn *callgraph.Node, c cpb.Capability) {
-			f := fn.Func.String()
-			caps[f] = append(caps[f], c)
+		func(node int64, c cpb.Capability) {
+			name := functionName(node)
+			caps[name] = append(caps[name], c)
 		},
 		nil)
 	expectedNodes := map[string]struct{}{
@@ -321,18 +321,16 @@ func TestGraphWithClassifier(t *testing.T) {
 }
 
 func TestAnalysisPackageGranularity(t *testing.T) {
-	pkgs, queriedPackages, cleanup, err := setup(filemap, "testlib")
-	if cleanup != nil {
-		defer cleanup()
-	}
-	if err != nil {
-		t.Fatalf("setup: %v", err)
-	}
-	cil := GetCapabilityInfo(pkgs, queriedPackages, &Config{
+	config := &Config{
 		Classifier:     interesting.DefaultClassifier(),
 		DisableBuiltin: false,
 		Granularity:    GranularityPackage,
-	})
+	}
+	graph, err := setup(filemap, config, "testlib")
+	if err != nil {
+		t.Fatalf("setup: %v", err)
+	}
+	cil := GetCapabilityInfo(graph, config)
 	expected := &cpb.CapabilityInfoList{
 		CapabilityInfo: []*cpb.CapabilityInfo{{
 			PackageName: proto.String("testlib"),
@@ -484,10 +482,12 @@ func TestIntermediatePackages(t *testing.T) {
 		},
 		ignoredEdges: nil,
 	}
-	pkgs, queriedPackages, cleanup, err := setup(filemap, "p4")
-	if cleanup != nil {
-		defer cleanup()
+	config := &Config{
+		Classifier:     &classifier,
+		DisableBuiltin: true,
+		Granularity:    GranularityIntermediate,
 	}
+	graph, err := setup(filemap, config, "p4")
 	if err != nil {
 		t.Fatalf("setup: %v", err)
 	}
@@ -600,12 +600,8 @@ func TestIntermediatePackages(t *testing.T) {
 		if err != nil {
 			t.Fatalf("NewCapabilitySet(%q): %v", test.capabilities, err)
 		}
-		cil := GetCapabilityInfo(pkgs, queriedPackages, &Config{
-			Classifier:     &classifier,
-			DisableBuiltin: true,
-			Granularity:    GranularityIntermediate,
-			CapabilitySet:  cs,
-		})
+		config.CapabilitySet = cs
+		cil := GetCapabilityInfo(graph, config)
 		opts := []cmp.Option{
 			protocmp.Transform(),
 			protocmp.SortRepeated(func(a, b *cpb.CapabilityInfo) bool {
@@ -640,10 +636,11 @@ func TestAlias(t *testing.T) {
 		},
 		ignoredEdges: nil,
 	}
-	pkgs, queriedPackages, cleanup, err := setup(filemap, "p2")
-	if cleanup != nil {
-		defer cleanup()
+	config := &Config{
+		Classifier:     &classifier,
+		DisableBuiltin: true,
 	}
+	graph, err := setup(filemap, config, "p2")
 	if err != nil {
 		t.Fatalf("setup: %v", err)
 	}
@@ -663,10 +660,7 @@ func TestAlias(t *testing.T) {
 		},
 	}
 
-	cil := GetCapabilityInfo(pkgs, queriedPackages, &Config{
-		Classifier:     &classifier,
-		DisableBuiltin: true,
-	})
+	cil := GetCapabilityInfo(graph, config)
 	opts := []cmp.Option{
 		protocmp.Transform(),
 		protocmp.SortRepeated(func(a, b *cpb.CapabilityInfo) bool {
@@ -685,6 +679,180 @@ func TestAlias(t *testing.T) {
 	}
 	if diff := cmp.Diff(expected, cil, opts...); diff != "" {
 		t.Errorf("GetCapabilityInfo: got %v, want %v; diff %s", cil, expected, diff)
+	}
+}
+
+func TestExportGraph(t *testing.T) {
+	filemap := map[string]string{"testlib/foo.go": `package testlib
+		import "unsafe"
+		type T int
+		func (t T) M() {}
+		func Foo() { Bar() }
+		func Bar() { T(3).M(); Baz(6); Baz("") }
+		func Baz[T interface{int | string}](a T) {
+			println(a)
+		}
+		func UP() {
+			var u unsafe.Pointer
+			println(*(*int)(u))
+		}
+	`}
+	classifier := &testClassifier{
+		functions: map[[2]string]cpb.Capability{
+			{"testlib", "testlib.Foo"}: cpb.Capability_CAPABILITY_FILES,
+		},
+	}
+	config := &Config{Classifier: classifier}
+	graph, err := setup(filemap, config, "testlib")
+	if err != nil {
+		t.Fatalf("setup: %v", err)
+	}
+	expected := &cpb.Graph{
+		Language: proto.String("Go"),
+		Functions: []*cpb.Graph_Function{
+			{
+				Name:     proto.String("testlib.Bar"),
+				Package:  proto.Int64(0),
+				Function: proto.String("Bar"),
+			},
+			{
+				Name:     proto.String("testlib.Baz"),
+				Package:  proto.Int64(0),
+				Function: proto.String("Baz"),
+			},
+			{
+				Name:          proto.String("testlib.Baz[int]"),
+				Package:       proto.Int64(0),
+				Function:      proto.String("Baz[int]"),
+				TypeArguments: []string{"int"},
+			},
+			{
+				Name:          proto.String("testlib.Baz[string]"),
+				Package:       proto.Int64(0),
+				Function:      proto.String("Baz[string]"),
+				TypeArguments: []string{"string"},
+			},
+			{
+				Name:     proto.String("testlib.Foo"),
+				Package:  proto.Int64(0),
+				Function: proto.String("Foo"),
+			},
+			{
+				Name:     proto.String("testlib.UP"),
+				Package:  proto.Int64(0),
+				Function: proto.String("UP"),
+			},
+			{
+				Name:     proto.String("testlib.init"),
+				Package:  proto.Int64(0),
+				Function: proto.String("init"),
+			},
+			{
+				Name:     proto.String("(*testlib.T).M"),
+				Package:  proto.Int64(0),
+				Type:     proto.String("*testlib.T"),
+				Function: proto.String("M"),
+			},
+			{
+				Name:     proto.String("(testlib.T).M"),
+				Package:  proto.Int64(0),
+				Type:     proto.String("testlib.T"),
+				Function: proto.String("M"),
+			},
+			{
+				Name:     proto.String("unsafe.init"),
+				Package:  proto.Int64(1),
+				Function: proto.String("init"),
+			},
+		},
+		Calls: []*cpb.Graph_Call{
+			{
+				Caller: proto.Int64(0),
+				Callee: proto.Int64(2),
+				CallSite: &cpb.Graph_Site{
+					Filename: proto.String("foo.go"),
+					Line:     proto.Int64(6),
+					Column:   proto.Int64(29),
+				},
+			},
+			{
+				Caller: proto.Int64(0),
+				Callee: proto.Int64(3),
+				CallSite: &cpb.Graph_Site{
+					Filename: proto.String("foo.go"),
+					Line:     proto.Int64(6),
+					Column:   proto.Int64(37),
+				},
+			},
+			{
+				Caller: proto.Int64(0),
+				Callee: proto.Int64(8),
+				CallSite: &cpb.Graph_Site{
+					Filename: proto.String("foo.go"),
+					Line:     proto.Int64(6),
+					Column:   proto.Int64(22),
+				},
+			},
+			{
+				Caller: proto.Int64(4),
+				Callee: proto.Int64(0),
+				CallSite: &cpb.Graph_Site{
+					Filename: proto.String("foo.go"),
+					Line:     proto.Int64(5),
+					Column:   proto.Int64(19),
+				},
+			},
+			{
+				Caller: proto.Int64(6),
+				Callee: proto.Int64(9),
+			},
+			{
+				Caller: proto.Int64(7),
+				Callee: proto.Int64(8),
+			},
+		},
+		Capabilities: []*cpb.Graph_FunctionCapability{
+			{
+				Function:   proto.Int64(4),
+				Capability: cpb.Capability_CAPABILITY_FILES.Enum(),
+			},
+			{
+				Function:   proto.Int64(5),
+				Capability: cpb.Capability_CAPABILITY_UNSAFE_POINTER.Enum(),
+				Implicit:   proto.Bool(true),
+			},
+		},
+		Packages: []*cpb.Graph_Package{
+			{
+				Name:   proto.String("testlib"),
+				Path:   proto.String("testlib"),
+				IsRoot: proto.Bool(true),
+			},
+			{
+				Name:              proto.String("unsafe"),
+				Path:              proto.String("unsafe"),
+				IsStandardLibrary: proto.Bool(true),
+			},
+		},
+	}
+	opts := []cmp.Option{
+		protocmp.Transform(),
+		protocmp.IgnoreFields(&cpb.Graph_Site{}, "directory"),
+		protocmp.FilterField(&cpb.Graph{}, "calls", protocmp.SortRepeated(func(a, b *cpb.Graph_Call) bool {
+			if a.GetCaller() != b.GetCaller() {
+				return a.GetCaller() < b.GetCaller()
+			}
+			return a.GetCallee() < b.GetCallee()
+		})),
+		protocmp.FilterField(&cpb.Graph{}, "capabilities", protocmp.SortRepeated(func(a, b *cpb.Graph_FunctionCapability) bool {
+			if a.GetFunction() != b.GetFunction() {
+				return a.GetFunction() < b.GetFunction()
+			}
+			return a.GetCapability() < b.GetCapability()
+		})),
+	}
+	if diff := cmp.Diff(expected, graph, opts...); diff != "" {
+		t.Errorf("ExportGraph: got %v, want %v; diff %s", graph, expected, diff)
 	}
 }
 
@@ -731,10 +899,11 @@ func Interesting() {}
 		},
 		ignoredEdges: nil,
 	}
-	pkgs, queriedPackages, cleanup, err := setup(filemap, "p1", "p2")
-	if cleanup != nil {
-		defer cleanup()
+	config := &Config{
+		Classifier:     &classifier,
+		DisableBuiltin: true,
 	}
+	graph, err := setup(filemap, config, "p1", "p2")
 	if err != nil {
 		t.Fatalf("setup: %v", err)
 	}
@@ -894,10 +1063,7 @@ func Interesting() {}
 		},
 	}
 
-	got := GetCapabilityInfo(pkgs, queriedPackages, &Config{
-		Classifier:     &classifier,
-		DisableBuiltin: true,
-	})
+	got := GetCapabilityInfo(graph, config)
 	opts := []cmp.Option{
 		protocmp.Transform(),
 		protocmp.SortRepeated(func(a, b *cpb.CapabilityInfo) bool {
