@@ -91,35 +91,33 @@ func GetCapabilityInfo(pkgs []*packages.Package, queriedPackages map[*types.Pack
 	}
 	type output struct {
 		*cpb.CapabilityInfo
-		*ssa.Function // used for sorting
+		*callgraph.Node // used for sorting
 	}
 	var caps []output
 	forEachPath(pkgs, queriedPackages,
 		func(cap cpb.Capability, nodes bfsStateMap, v *callgraph.Node) {
-			i := 0
-			c := cpb.CapabilityInfo{}
-			fn := v.Func
-			var n string
-			var ctype cpb.CapabilityType
-			var incomingEdge *callgraph.Edge
+			var (
+				c = cpb.CapabilityInfo{
+					Capability:     cap.Enum(),
+					CapabilityType: cpb.CapabilityType_CAPABILITY_TYPE_DIRECT.Enum(),
+				}
+				v0           = v
+				firstPackage = nodeToPackage(v)
+				incomingEdge *callgraph.Edge
+			)
+			if firstPackage != nil {
+				c.PackageDir = proto.String(firstPackage.Path())
+				c.PackageName = proto.String(firstPackage.Name())
+			}
 			for v != nil {
-				if !config.OmitPaths || (i == 0 && config.Granularity == GranularityFunction) {
+				if !config.OmitPaths || (v == v0 && config.Granularity == GranularityFunction) {
 					addFunction(&c.Path, v, incomingEdge)
 				}
-				if i == 0 {
-					n = v.Func.Package().Pkg.Path()
-					ctype = cpb.CapabilityType_CAPABILITY_TYPE_DIRECT
-					c.Capability = cap.Enum()
-					c.PackageDir = proto.String(v.Func.Package().Pkg.Path())
-					c.PackageName = proto.String(v.Func.Package().Pkg.Name())
-				}
-				i++
-				if pName := packagePath(v.Func); n != pName && !isStdLib(pName) {
-					ctype = cpb.CapabilityType_CAPABILITY_TYPE_TRANSITIVE
+				if p := nodeToPackage(v); p != nil && p != firstPackage && !isStdLib(p.Path()) {
+					*c.CapabilityType = cpb.CapabilityType_CAPABILITY_TYPE_TRANSITIVE
 				}
 				incomingEdge, v = nodes[v].edge, nodes[v].next()
 			}
-			c.CapabilityType = &ctype
 			if !config.OmitPaths {
 				var b strings.Builder
 				for i, p := range c.Path {
@@ -130,28 +128,24 @@ func GetCapabilityInfo(pkgs []*packages.Package, queriedPackages map[*types.Pack
 				}
 				c.DepPath = proto.String(b.String())
 			}
-			caps = append(caps, output{&c, fn})
+			caps = append(caps, output{&c, v0})
 		}, config)
 	sort.Slice(caps, func(i, j int) bool {
 		if x, y := caps[i].CapabilityInfo.GetCapability(), caps[j].CapabilityInfo.GetCapability(); x != y {
 			return x < y
 		}
-		return funcCompare(caps[i].Function, caps[j].Function) < 0
+		return nodeCompare(caps[i].Node, caps[j].Node) < 0
 	})
 	if config.Granularity == GranularityPackage {
 		// Keep only the first entry in the sorted list for each (capability, package) pair.
 		type cp struct {
 			cpb.Capability
-			*ssa.Package
+			*types.Package
 		}
 		seen := make(map[cp]struct{})
 		// del returns true if the capability and package of o have been seen before.
 		del := func(o output) bool {
-			var pkg *ssa.Package
-			if o.Function != nil {
-				pkg = o.Function.Package()
-			}
-			cp := cp{o.CapabilityInfo.GetCapability(), pkg}
+			cp := cp{o.CapabilityInfo.GetCapability(), nodeToPackage(o.Node)}
 			if _, ok := seen[cp]; ok {
 				return true
 			}
@@ -193,20 +187,18 @@ func GetCapabilityStats(pkgs []*packages.Package, queriedPackages map[*types.Pac
 			} else {
 				cm[cap.String()].count += 1
 			}
-			i := 0
-			var n string
-			var incomingEdge *callgraph.Edge
-			isDirect := true
-			e := []*cpb.Function{}
+			var (
+				v0           = v
+				firstPackage = nodeToPackage(v)
+				incomingEdge *callgraph.Edge
+				isDirect     = true
+				example      []*cpb.Function
+			)
 			for v != nil {
-				if !config.OmitPaths || i == 0 {
-					addFunction(&e, v, incomingEdge)
+				if !config.OmitPaths || v == v0 {
+					addFunction(&example, v, incomingEdge)
 				}
-				if i == 0 {
-					n = v.Func.Package().Pkg.Path()
-				}
-				i++
-				if pName := packagePath(v.Func); n != pName && !isStdLib(pName) {
+				if p := nodeToPackage(v); p != nil && p != firstPackage && !isStdLib(p.Path()) {
 					isDirect = false
 				}
 				incomingEdge, v = nodes[v].edge, nodes[v].next()
@@ -225,9 +217,9 @@ func GetCapabilityStats(pkgs []*packages.Package, queriedPackages map[*types.Pac
 				}
 			}
 			if _, ok := cm[cap.String()]; !ok {
-				cm[cap.String()] = &CapabilityCounter{example: e}
+				cm[cap.String()] = &CapabilityCounter{example: example}
 			} else {
-				cm[cap.String()].example = e
+				cm[cap.String()].example = example
 			}
 		}, config)
 	for _, counts := range cm {
@@ -778,8 +770,8 @@ func forEachPath(pkgs []*packages.Package, queriedPackages map[*types.Package]st
 				}
 				visited[w] = bfsState{edge: edge}
 				q = append(q, w)
-				if w.Func.Package() != nil {
-					if _, ok := queriedPackages[nodeToPackage(w)]; ok {
+				if pkg := nodeToPackage(w); pkg != nil {
+					if _, ok := queriedPackages[pkg]; ok {
 						fn(cap, visited, w)
 					}
 				}

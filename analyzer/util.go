@@ -95,13 +95,9 @@ func (s byCallee) Swap(i, j int) {
 	s[i], s[j] = s[j], s[i]
 }
 
-func nodeCompare(a, b *callgraph.Node) int {
-	return funcCompare(a.Func, b.Func)
-}
-
-// funcCompare orders by package path, then by whether the function is a
+// nodeCompare orders by package path, then by whether the function is a
 // method, then by name.  Returns {-1, 0, +1} in the manner of strings.Compare.
-func funcCompare(a, b *ssa.Function) int {
+func nodeCompare(a, b *callgraph.Node) int {
 	// Put nils last.
 	if a == nil && b == nil {
 		return 0
@@ -110,19 +106,28 @@ func funcCompare(a, b *ssa.Function) int {
 	} else if a == nil {
 		return +1
 	}
-	if c := strings.Compare(packagePath(a), packagePath(b)); c != 0 {
-		return c
+	pa, pb := nodeToPackage(a), nodeToPackage(b)
+	if pa != nil || pb != nil {
+		if pa == nil {
+			return +1
+		}
+		if pb == nil {
+			return -1
+		}
+		if c := strings.Compare(pa.Path(), pb.Path()); c != 0 {
+			return c
+		}
 	}
 	hasReceiver := func(f *ssa.Function) bool {
 		sig := f.Signature
 		return sig != nil && sig.Recv() != nil
 	}
-	if ar, br := hasReceiver(a), hasReceiver(b); !ar && br {
+	if ar, br := hasReceiver(a.Func), hasReceiver(b.Func); !ar && br {
 		return -1
 	} else if ar && !br {
 		return +1
 	}
-	return strings.Compare(a.String(), b.String())
+	return strings.Compare(a.Func.String(), b.Func.String())
 }
 
 // positionLess implements an ordering on token.Position.
@@ -143,28 +148,6 @@ func positionLess(p1, p2 token.Position) bool {
 		return p1.Filename < p2.Filename
 	}
 	return p1.Offset < p2.Offset
-}
-
-// packagePath returns the name of the package the function belongs to, or
-// "" if it has no package.
-func packagePath(f *ssa.Function) string {
-	// If f is an instantiation of a generic function, use its origin.
-	if f.Origin() != nil {
-		f = f.Origin()
-	}
-	if ssaPackage := f.Package(); ssaPackage != nil {
-		if typesPackage := ssaPackage.Pkg; typesPackage != nil {
-			return typesPackage.Path()
-		}
-	}
-	// Check f.Object() for a package.  This covers the case of synthetic wrapper
-	// functions for promoted methods of embedded fields.
-	if obj := types.Object(f.Object()); obj != nil {
-		if typesPackage := obj.Pkg(); typesPackage != nil {
-			return typesPackage.Path()
-		}
-	}
-	return ""
 }
 
 // callsitePosition returns a token.Position for the edge's callsite.

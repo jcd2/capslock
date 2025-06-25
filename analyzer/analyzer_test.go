@@ -11,6 +11,7 @@ import (
 	"go/types"
 	"os"
 	"reflect"
+	"strings"
 	"testing"
 
 	"github.com/google/capslock/interesting"
@@ -795,6 +796,36 @@ func Interesting() {}
 				PackageDir: proto.String("p1"),
 			},
 			{
+				PackageName: proto.String("p1"),
+				Capability:  cpb.Capability_CAPABILITY_FILES.Enum(),
+				Path: []*cpb.Function{
+					&cpb.Function{Name: proto.String("(p1.Embedder).M"), Package: proto.String("p1")},
+					&cpb.Function{Name: proto.String("(p2.Foo).M"), Package: proto.String("p2")},
+					&cpb.Function{Name: proto.String("p2.Interesting"), Package: proto.String("p2")},
+				},
+				PackageDir: proto.String("p1"),
+			},
+			{
+				PackageName: proto.String("p1"),
+				Capability:  cpb.Capability_CAPABILITY_FILES.Enum(),
+				Path: []*cpb.Function{
+					&cpb.Function{Name: proto.String("(*p1.Embedder).M"), Package: proto.String("p1")},
+					&cpb.Function{Name: proto.String("(p2.Foo).M"), Package: proto.String("p2")},
+					&cpb.Function{Name: proto.String("p2.Interesting"), Package: proto.String("p2")},
+				},
+				PackageDir: proto.String("p1"),
+			},
+			{
+				PackageName: proto.String("p1"),
+				Capability:  cpb.Capability_CAPABILITY_FILES.Enum(),
+				Path: []*cpb.Function{
+					&cpb.Function{Name: proto.String("(*p1.Embedder).PM"), Package: proto.String("p1")},
+					&cpb.Function{Name: proto.String("(*p2.Foo).PM"), Package: proto.String("p2")},
+					&cpb.Function{Name: proto.String("p2.Interesting"), Package: proto.String("p2")},
+				},
+				PackageDir: proto.String("p1"),
+			},
+			{
 				PackageName: proto.String("p2"),
 				Capability:  cpb.Capability_CAPABILITY_FILES.Enum(),
 				Path: []*cpb.Function{
@@ -820,6 +851,46 @@ func Interesting() {}
 				},
 				PackageDir: proto.String("p2"),
 			},
+			{
+				PackageName: proto.String("p2"),
+				Capability:  cpb.Capability_CAPABILITY_FILES.Enum(),
+				Path: []*cpb.Function{
+					&cpb.Function{Name: proto.String("(p2.Foo).M$bound"), Package: proto.String("p2")},
+					&cpb.Function{Name: proto.String("(p2.Foo).M"), Package: proto.String("p2")},
+					&cpb.Function{Name: proto.String("p2.Interesting"), Package: proto.String("p2")},
+				},
+				PackageDir: proto.String("p2"),
+			},
+			{
+				PackageName: proto.String("p2"),
+				Capability:  cpb.Capability_CAPABILITY_FILES.Enum(),
+				Path: []*cpb.Function{
+					&cpb.Function{Name: proto.String("(*p2.Foo).M$thunk"), Package: proto.String("p2")},
+					&cpb.Function{Name: proto.String("(p2.Foo).M"), Package: proto.String("p2")},
+					&cpb.Function{Name: proto.String("p2.Interesting"), Package: proto.String("p2")},
+				},
+				PackageDir: proto.String("p2"),
+			},
+			{
+				PackageName: proto.String("p2"),
+				Capability:  cpb.Capability_CAPABILITY_FILES.Enum(),
+				Path: []*cpb.Function{
+					&cpb.Function{Name: proto.String("(p2.Foo).M$thunk"), Package: proto.String("p2")},
+					&cpb.Function{Name: proto.String("(p2.Foo).M"), Package: proto.String("p2")},
+					&cpb.Function{Name: proto.String("p2.Interesting"), Package: proto.String("p2")},
+				},
+				PackageDir: proto.String("p2"),
+			},
+			{
+				PackageName: proto.String("p2"),
+				Capability:  cpb.Capability_CAPABILITY_FILES.Enum(),
+				Path: []*cpb.Function{
+					&cpb.Function{Name: proto.String("(*p2.Foo).M"), Package: proto.String("p2")},
+					&cpb.Function{Name: proto.String("(p2.Foo).M"), Package: proto.String("p2")},
+					&cpb.Function{Name: proto.String("p2.Interesting"), Package: proto.String("p2")},
+				},
+				PackageDir: proto.String("p2"),
+			},
 		},
 	}
 
@@ -833,7 +904,16 @@ func Interesting() {}
 			if u, v := a.GetCapability(), b.GetCapability(); u != v {
 				return u < v
 			}
-			return a.GetPackageDir() < b.GetPackageDir()
+			if c := strings.Compare(a.GetPackageDir(), b.GetPackageDir()); c != 0 {
+				return c < 0
+			}
+			if len(a.Path) == 0 {
+				return false
+			}
+			if len(b.Path) == 0 {
+				return true
+			}
+			return a.Path[0].GetName() < b.Path[0].GetName()
 		}),
 		protocmp.IgnoreFields(&cpb.CapabilityInfoList{}, "package_info"),
 		protocmp.IgnoreFields(&cpb.CapabilityInfo{}, "dep_path"),
