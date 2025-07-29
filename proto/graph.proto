@@ -15,42 +15,160 @@ option go_package = "github.com/google/capslock/proto";
 message Graph {
   optional string language = 1;
 
+  // Function specifies a function in the program.
+  //
+  // Here are some JSON examples of this message for various kinds of Go
+  // functions.
+  //
+  // A method on the "time.Duration" type:
+  //
+  // {
+  //   "name": "(time.Duration).Microseconds",
+  //   "package": "196",
+  //   "type": "time.Duration",
+  //   "function": "Microseconds"
+  // },
+  //
+  // A regular (non-method) function:
+  //
+  // {
+  //   "name": "os.ReadFile",
+  //   "package": "176",
+  //   "function": "ReadFile"
+  // },
+  //
+  // A method that uses a pointer receiver.  In the "name" field this is
+  // indicated by an asterisk before the type name.  "pointer receiver" is
+  // added to the "properties" field:
+  //
+  // {
+  //   "name": "(*bufio.Reader).Size",
+  //   "package": "0",
+  //   "type": "bufio.Reader",
+  //   "function": "Size",
+  //   "properties": [
+  //     "pointer receiver"
+  //   ]
+  // },
+  //
+  // An instantiation of a generic function:
+  //
+  // {
+  //   "name": "cmp.Compare[float64]",
+  //   "package": "2",
+  //   "function": "Compare",
+  //   "templateArguments": [
+  //     "float64"
+  //   ]
+  // },
+  //
+  // An instantiation of a generic method:
+  //
+  // {
+  //   "name": "(*sync/atomic.Pointer[go/token.File]).Load[go/token.File]",
+  //   "package": "191",
+  //   "type": "sync/atomic.Pointer[go/token.File]",
+  //   "function": "Load",
+  //   "templateArguments": [ "go/token.File" ],
+  //   "properties": [ "pointer receiver" ]
+  // }
   message Function {
+    // "name" contains a human-readable fully-qualified name for the function,
+    // which ideally is unique.  It should be in a format that is familiar to
+    // users of the language the function is written in.
     optional string name = 1;
+
+    // "package" is an index into the packages field.
     optional int64 package = 2;
+
+    // "type" contains the class or type to which this method belongs.  If it
+    // is not a method, type will not be present.
     optional string type = 3;
+
+    // "function" is the name of the function or method.
     optional string function = 4;
-    repeated string type_arguments = 5;
-    repeated string parameter_types = 6;
+
+    // "templateArguments" contains arguments that were used to instantiate a
+    // generic type or function.
+    repeated string templateArguments = 5;
+
+    // "parameterTypes" is used when needed to distinguish between overloaded
+    // functions that have the same name but different parameters.
+    repeated string parameterTypes = 6;
+
+    // "properties" contains a set of miscellaneous language-specific properties
+    // of the function.
     repeated string properties = 7;
+
+    // "language" contains the language the function is written in, if it
+    // differs from the top-level "language" field.
     optional string language = 8;
   }
   repeated Function functions = 2;
 
   message Call {
+    // "caller" is an index into "functions".
     optional int64 caller = 1;
+
+    // "callee" is an index into "functions".
     optional int64 callee = 2;
-    optional Site call_site = 3;
+
+    // "callSite" indicates the location of this call in the source code of the
+    // caller.  This is optional.
+    optional Site callSite = 3;
   }
   repeated Call calls = 3;
 
   message FunctionCapability {
+    // "function" is an index into "functions".
     optional int64 function = 1;
     optional Capability capability = 2;
+
+    // "site" is an optional field which indicates the location in the source
+    // code where a capability is used.
     optional Site site = 3;
+
+    // "implicit" indicates that this capability was determined through source
+    // code analysis, rather than an explicit categorization of functions in
+    // the language's standard library.
     optional bool implicit = 4;
   }
   repeated FunctionCapability capabilities = 4;
 
+  // Package denotes a collection of types and functions in a common location.
+  //
+  // An example package for a Go library:
+  // {
+  //   "name": "exec",
+  //   "path": "os/exec",
+  //   "isStandardLibrary": true
+  // }
   message Package {
+    // "name" is a short name by which the package is generally referred to in
+    // code.
     optional string name = 1;
+
+    // "path" is a fully-qualified name for the package, which ideally is
+    // unique.
     optional string path = 2;
+
+    // "module" is an index into "modules".  This is optional.
     optional int64 module = 3;
-    optional bool is_root = 4;
-    optional bool is_standard_library = 5;
+
+    // "isRoot" indicates that this is one of the top-level packages we are
+    // analyzing, rather than a dependency.  If not present, it is assumed to
+    // be false.
+    optional bool isRoot = 4;
+
+    // "isStandardLibrary" indicates that this package belongs to its
+    // language's standard library.  This is optional.
+    optional bool isStandardLibrary = 5;
   }
   repeated Package packages = 5;
 
+  // A module helps describe the provenance of packages by grouping them into
+  // sets of packages that are downloaded together from a package manager.
+  // These are optional.
   message Module {
     optional string name = 1;
     optional string version = 2;

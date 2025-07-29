@@ -548,8 +548,13 @@ func ExportGraph(pkgs []*packages.Package, config *Config) *cpb.Graph {
 		var fs []elem
 		for fn, node := range graph.Nodes {
 			gfn := &cpb.Graph_Function{
-				Name:     proto.String(fn.String()),
-				Function: proto.String(fn.Name()),
+				Name: proto.String(fn.String()),
+			}
+			if o := fn.Origin(); o != nil {
+				// Use the origin's name, which won't have the type arguments.
+				gfn.Function = proto.String(o.Name())
+			} else {
+				gfn.Function = proto.String(fn.Name())
 			}
 			if pkg := nodeToPackage(node); pkg != nil {
 				gfn.Package = pkgIndex[pkg]
@@ -557,12 +562,17 @@ func ExportGraph(pkgs []*packages.Package, config *Config) *cpb.Graph {
 			if sig := fn.Signature; sig != nil {
 				if recv := sig.Recv(); recv != nil {
 					if t := recv.Type(); t != nil {
-						gfn.Type = proto.String(t.String())
+						if ptr, ok := t.(*types.Pointer); ok {
+							gfn.Type = proto.String(ptr.Elem().String())
+							gfn.Properties = []string{"pointer receiver"}
+						} else {
+							gfn.Type = proto.String(t.String())
+						}
 					}
 				}
 			}
 			for _, t := range fn.TypeArgs() {
-				gfn.TypeArguments = append(gfn.TypeArguments, t.String())
+				gfn.TemplateArguments = append(gfn.TemplateArguments, t.String())
 			}
 			fs = append(fs, elem{gfn, node})
 		}
